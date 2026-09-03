@@ -25,6 +25,7 @@ from google import genai
 from google.genai import types
 
 from gemini_review import (
+    DEFAULT_MODEL,
     DEFAULT_TIMEOUT,
     DynamicContextSelection,
     InlineComment,
@@ -43,6 +44,7 @@ from gemini_review import (
     format_pr_comment_history,
     generate_file_tree,
     get_all_repo_files,
+    get_default_model,
     get_file_content,
     get_google_auth_headers,
     get_google_developer_documents,
@@ -77,6 +79,7 @@ from gemini_review import (
 # __all__ explicitly marks these imported symbols as public re-exports for backward compatibility.
 # This prevents linters (such as Ruff) from pruning unused facade imports needed by tests and external callers.
 __all__ = [
+    "DEFAULT_MODEL",
     "DEFAULT_TIMEOUT",
     "DynamicContextSelection",
     "InlineComment",
@@ -93,6 +96,7 @@ __all__ = [
     "format_pr_comment_history",
     "generate_file_tree",
     "get_all_repo_files",
+    "get_default_model",
     "get_file_content",
     "get_google_auth_headers",
     "get_google_developer_documents",
@@ -130,7 +134,7 @@ def main():
     use_vertexai = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "False").lower() in ("true", "1")
     project = os.environ.get("GOOGLE_CLOUD_PROJECT")
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-    model_name = os.environ.get("GEMINI_MODEL", os.environ.get("MODEL", "gemini-3.7-flash"))
+    model_name = get_default_model()
 
     try:
         timeout = int(os.environ.get("GEMINI_TIMEOUT", str(DEFAULT_TIMEOUT)))
