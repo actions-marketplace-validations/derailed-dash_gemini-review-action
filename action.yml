@@ -1,5 +1,5 @@
-name: "Dazbo's Gemini Review & Triage"
-description: "Automated Pull Request code reviews and Issue Triage using Google Gemini"
+name: "Dazbo's Gemini Code Review & Issue Triage"
+description: "Automated Pull Request AI code reviews and Issue Triage using Google Gemini"
 author: 'Dazbo (derailed-dash)'
 
 # Note: To control which files trigger this action, configure `paths` or `paths-ignore`
@@ -27,7 +27,7 @@ inputs:
   gemini_model:
     description: 'Gemini model to use'
     required: false
-    default: 'gemini-3.5-flash'
+    default: 'gemini-3.8-flash'
   command:
     description: 'Command to run (review, triage)'
     required: false
@@ -40,6 +40,45 @@ inputs:
     description: 'Timeout for API requests in seconds'
     required: false
     default: '60'
+  include_comment_history:
+    description: 'Fetch and include prior PR review threads and conversation comments in prompt context'
+    required: false
+    default: 'true'
+  billing_labels:
+    description: >-
+      Extra Cloud Billing labels for cost attribution, as `key=value,key=value`. Merged over the
+      defaults (`component`, `repo`). Set to `none` to disable. VERTEX AI ONLY: the Gemini
+      Developer API has no labels field, so this is ignored when authenticating with an API key.
+    required: false
+    default: ''
+  resolve_addressed_threads:
+    description: >-
+      Resolve the GitHub review threads for findings this action reports as addressed, so
+      "Require conversation resolution before merging" stops blocking on feedback the reviewer
+      has already agreed is done. Only threads opened by this action, and only where the model
+      supplied an exact file and line, are ever resolved. Off by default: closing a
+      human-visible thread on someone's behalf is opinionated. NOTE: this requires a PAT or
+      GitHub App token in `github_token`; the default GITHUB_TOKEN cannot resolve threads
+      (the mutation is refused with FORBIDDEN) and the action will say so and carry on.
+    required: false
+    default: 'false'
+  exclude_comment_authors:
+    description: >-
+      Comma-separated GitHub logins whose comments are kept OUT of the prompt, e.g.
+      `claude[bot],some-other-reviewer[bot]`. Comment history exists so the reviewer does not
+      re-raise its OWN addressed feedback; another automated reviewer's comments serve a
+      different purpose entirely, since they hand this model its conclusions. Excluded comments
+      never reach the prompt and are not counted in the reported tokens.
+    required: false
+    default: ''
+  persona:
+    description: 'Persona overlay for reviewer (straight, dazbo, palpatine, rick)'
+    required: false
+    default: 'straight'
+  skip_inline_suggestions:
+    description: 'Skip automated re-reviews when a commit is created by accepting an inline suggestion via GitHub UI'
+    required: false
+    default: 'true'
 
 runs:
   using: 'composite'
@@ -47,7 +86,7 @@ runs:
     - name: Set up Python
       uses: actions/setup-python@v6
       with:
-        python-version: '3.12'
+        python-version: '3.13'
 
     - name: Install uv
       uses: astral-sh/setup-uv@v5
@@ -60,7 +99,14 @@ runs:
         GEMINI_MODEL: ${{ inputs.gemini_model }}
         GEMINI_LANGUAGE: ${{ inputs.language }}
         GEMINI_TIMEOUT: ${{ inputs.timeout }}
+        GEMINI_EXCLUDE_COMMENT_AUTHORS: ${{ inputs.exclude_comment_authors }}
+        GEMINI_RESOLVE_ADDRESSED_THREADS: ${{ inputs.resolve_addressed_threads }}
+        GEMINI_INCLUDE_COMMENT_HISTORY: ${{ inputs.include_comment_history }}
+        GEMINI_PERSONA: ${{ inputs.persona }}
+        GEMINI_BILLING_LABELS: ${{ inputs.billing_labels }}
+        GEMINI_SKIP_INLINE_SUGGESTIONS: ${{ inputs.skip_inline_suggestions }}
         GITHUB_REPOSITORY: ${{ github.repository }}
+
         GITHUB_EVENT_PATH: ${{ github.event_path }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
       run: |

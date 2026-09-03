@@ -1,6 +1,6 @@
 # /// script
 # dependencies = [
-#   "google-genai>=2.10.0",
+#   "google-genai>=2.12.1",
 #   "requests",
 #   "pydantic",
 # ]
@@ -16,452 +16,20 @@ and stdout, which are viewable in the GitHub Actions runner execution logs
 for the workflow run.
 """
 
-import fnmatch
 import json
 import os
-import subprocess
 import sys
-import tomllib
 
 import requests
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
 
-DEFAULT_TIMEOUT = 60
+import gemini_review as gr
 
 
-class InlineComment(BaseModel):
-    """Represents a single inline comment to be posted on a file in the Pull Request."""
-    path: str = Field(description="The relative file path being reviewed.")
-    line: int = Field(description="The line number in the RIGHT (new/modified) version of the file where the comment applies.")
-    side: str = Field(default="RIGHT", description="Must be 'RIGHT' for additions/modifications or 'LEFT' for deletions.")
-    severity: str = Field(description="Severity icon: 🔴 (Critical), 🟠 (High), 🟡 (Medium), 🟢 (Low)")
-    comment_text: str = Field(description="Constructive feedback explaining the issue. Write the feedback comments in the requested language.")
-    code_suggestion: str | None = Field(None, description="Optional drop-in code suggestion replacement. Must match the exact structure and indentation of the replaced code, formatted as a suggestion.")
-
-
-class ReviewResult(BaseModel):
-    """Represents the structured review results returned by the Gemini model."""
-    summary: str = Field(description="A brief, high-level assessment of the Pull Request's objective and quality (2-3 sentences).")
-    general_feedback: list[str] = Field(description="A list of general observations, positive highlights, or recurring patterns.")
-    comments: list[InlineComment] = Field(description="List of targeted inline comments on the code changes.")
-
-
-def is_text_file(filename: str) -> bool:
-    """Filter out typical binary, lock, and encrypted file formats."""
-    excluded_extensions = {
-        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".pdf", ".zip", ".tar", ".gz",
-        ".enc", ".lock", ".db", ".pyc", ".o", ".so", ".dylib", ".dll", ".exe",
-        ".woff", ".woff2", ".eot", ".ttf"
-    }
-    _, ext = os.path.splitext(filename.lower())
-    if ext in excluded_extensions:
-        return False
-
-    excluded_names = {"package-lock.json", "uv.lock", ".env", ".env.enc", ".envrc"}
-    if os.path.basename(filename) in excluded_names:
-        return False
-
-    return True
-
-
-def get_valid_changed_lines(patch: str) -> set[int]:
-    """Parse the diff patch to find all line numbers in the new file (RIGHT side) that are part of the diff."""
-    valid_lines = set()
-    if not patch:
-        return valid_lines
-
-    current_line = 0
-    for line in patch.splitlines():
-        if line.startswith("@@"):
-            try:
-                # Header format: @@ -old_start,old_count +new_start,new_count @@
-                parts = line.split()
-                new_info = parts[2].lstrip("+")
-                if "," in new_info:
-                    start_line, _ = new_info.split(",")
-                else:
-                    start_line = new_info
-                current_line = int(start_line)
-            except Exception:
-                current_line = 0
-        elif line.startswith("+") or line.startswith(" ") or line == "":
-            if current_line > 0:
-                valid_lines.add(current_line)
-                current_line += 1
-        elif line.startswith("-"):
-            # Deleted lines do not advance line numbers in the new file (RIGHT side)
-            pass
-    return valid_lines
-
-
-def filter_review_comments(review: ReviewResult, text_files: list) -> ReviewResult:
-    """Filter inline comments to ensure they apply to valid lines in the diff, redirecting others to general feedback."""
-    # Map file path -> set of valid line numbers
-    file_patches = {f["filename"]: f.get("patch", "") for f in text_files}
-    valid_lines_by_file = {
-        filename: get_valid_changed_lines(patch)
-        for filename, patch in file_patches.items()
-    }
-
-    filtered_comments = []
-    redirected_feedback = []
-
-    for comment in review.comments:
-        comment_path = comment.path.replace("\\", "/")
-
-        matched_file = None
-        for fn in valid_lines_by_file:
-            if fn.replace("\\", "/").lower() == comment_path.lower():
-                matched_file = fn
-                break
-
-        if not matched_file:
-            warning_msg = f"Warning: Redirecting inline comment on {comment.path}:{comment.line} (File not found in PR changes)."
-            print(warning_msg, file=sys.stderr)
-
-            feedback_item = f"**{comment.path}** (Line {comment.line}): {comment.severity} {comment.comment_text}"
-            if comment.code_suggestion:
-                feedback_item += f"\n  ```suggestion\n  {comment.code_suggestion}\n  ```"
-            redirected_feedback.append(feedback_item)
-            continue
-
-        valid_lines = valid_lines_by_file[matched_file]
-        if comment.line in valid_lines:
-            comment.path = matched_file
-            filtered_comments.append(comment)
-        else:
-            warning_msg = f"Warning: Redirecting inline comment on {comment.path}:{comment.line} (Line not in PR diff patch)."
-            print(warning_msg, file=sys.stderr)
-
-            feedback_item = f"**{comment.path}** (Line {comment.line}): {comment.severity} {comment.comment_text}"
-            if comment.code_suggestion:
-                feedback_item += f"\n  ```suggestion\n  {comment.code_suggestion}\n  ```"
-            redirected_feedback.append(feedback_item)
-
-    if redirected_feedback:
-        review.general_feedback.append("💡 **Additional Feedback on Unmodified Lines:**")
-        review.general_feedback.extend(redirected_feedback)
-
-    review.comments = filtered_comments
-    return review
-
-
-def get_file_content(path: str) -> str:
-    """Read file content safely as UTF-8."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return ""
-
-
-def get_pr_files(repository: str, pr_number: int, headers: dict, timeout: int = DEFAULT_TIMEOUT) -> list:
-    """Fetch changed files list in PR using pagination."""
-    files = []
-    page = 1
-    while True:
-        url = f"https://api.github.com/repos/{repository}/pulls/{pr_number}/files?page={page}&per_page=100"
-        response = requests.get(url, headers=headers, timeout=timeout)
-        if response.status_code != 200:
-            print(f"Error fetching files: {response.status_code} - {response.text}", file=sys.stderr)
-            break
-        data = response.json()
-        if not data:
-            break
-        files.extend(data)
-        page += 1
-    return files
-
-
-def get_local_git_files() -> list:
-    """Developer fallback to gather file diffs from local git tree."""
-    try:
-        res = subprocess.run(["git", "diff", "main...HEAD", "--name-only"], capture_output=True, text=True, check=True)
-        filenames = [f.strip() for f in res.stdout.split("\n") if f.strip()]
-
-        files = []
-        for filename in filenames:
-            diff_res = subprocess.run(["git", "diff", "main...HEAD", "--", filename], capture_output=True, text=True, check=True)
-            files.append({
-                "filename": filename,
-                "status": "modified",
-                "patch": diff_res.stdout
-            })
-        return files
-    except Exception as e:
-        print(f"Error running local git diff: {e}", file=sys.stderr)
-        return []
-
-
-def load_config() -> dict:
-    """Load configuration from gemini-review.toml."""
-    path = ".github/commands/gemini-review.toml"
-    if not os.path.exists(path):
-        action_default_path = os.path.join(os.path.dirname(__file__), "starter-examples", "gemini-review.toml")
-        if os.path.exists(action_default_path):
-            path = action_default_path
-        else:
-            return {}
-
-    try:
-        with open(path, "rb") as f:
-            return tomllib.load(f)
-    except Exception as e:
-        print(f"Warning: Failed to load config from {path}: {e}", file=sys.stderr)
-        return {}
-
-
-def get_all_repo_files() -> list[str]:
-    """Get list of all tracked text files in the repository."""
-    try:
-        res = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True)
-        all_files = [f.strip() for f in res.stdout.split("\n") if f.strip()]
-        return [f.replace("\\", "/") for f in all_files if is_text_file(f) and os.path.exists(f)]
-    except Exception as e:
-        print(f"Error running git ls-files: {e}", file=sys.stderr)
-        # Fallback to os.walk if git is not available
-        text_files = []
-        for root, dirs, files in os.walk("."):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for file in files:
-                filepath = os.path.relpath(os.path.join(root, file), ".")
-                if is_text_file(filepath) and os.path.exists(filepath):
-                    text_files.append(filepath.replace("\\", "/"))
-        return text_files
-
-
-def is_core_file(filename: str, patterns: list[str]) -> bool:
-    """Check if the filename matches any of the core file patterns."""
-    basename = os.path.basename(filename)
-    for pattern in patterns:
-        if fnmatch.fnmatch(basename, pattern) or fnmatch.fnmatch(filename, pattern):
-            return True
-    return False
-
-
-def generate_file_tree(files: list[str]) -> str:
-    """Generate a text-based folder tree structure from a list of file paths."""
-    tree = {}
-    for f in sorted(files):
-        parts = f.replace("\\", "/").split("/")
-        curr = tree
-        for part in parts:
-            if part not in curr:
-                curr[part] = {}
-            curr = curr[part]
-
-    def _render(node: dict, indent: str = "") -> list[str]:
-        lines = []
-        keys = list(node.keys())
-        for idx, key in enumerate(keys):
-            is_last = (idx == len(keys) - 1)
-            marker = "└── " if is_last else "├── "
-            child_indent = "    " if is_last else "│   "
-            if node[key]:
-                lines.append(f"{indent}{marker}{key}/")
-                lines.extend(_render(node[key], indent + child_indent))
-            else:
-                lines.append(f"{indent}{marker}{key}")
-        return lines
-
-    return ".\n" + "\n".join(_render(tree))
-
-
-def load_system_instruction(repository: str | None, pr_number: int, config: dict) -> str:
-    """Load system instructions from Dazbo's gemini-review.toml prompt configuration."""
-    prompt = config.get("prompt", "")
-    if not prompt:
-        return f"You are a world-class code review agent. Analyze changes and output constructive feedback using {os.environ.get('GEMINI_LANGUAGE', 'English (UK)')} spelling."
-
-    prompt = prompt.replace("!{echo $REPOSITORY}", repository or "unknown")
-    prompt = prompt.replace("!{echo $PULL_REQUEST_NUMBER}", str(pr_number))
-    prompt = prompt.replace("!{echo $ADDITIONAL_CONTEXT}", "")
-
-    language = os.environ.get("GEMINI_LANGUAGE", "English (UK)")
-    prompt = prompt.replace("!{echo $LANGUAGE}", language)
-    return prompt
-
-
-
-def build_prompt(files: list, config: dict) -> str:
-    """Consolidate file patches and file contents into a single review context."""
-    prompt_parts = []
-    prompt_parts.append("Below are the files and changes included in this Pull Request:\n")
-
-    pr_filenames = {f["filename"] for f in files}
-
-    for f in files:
-        filename = f["filename"]
-        status = f["status"]
-        patch = f.get("patch", "")
-
-        if not is_text_file(filename) or not patch:
-            continue
-
-        full_content = get_file_content(filename)
-
-        prompt_parts.append(f"=== File: {filename} ===")
-        prompt_parts.append(f"Status: {status}")
-        prompt_parts.append("--- Diff (Patch) ---")
-        prompt_parts.append(patch)
-        if full_content:
-            prompt_parts.append("--- Full Current File Content ---")
-            prompt_parts.append(full_content)
-        prompt_parts.append("=========================\n")
-
-    # Add Repository Context (Hybrid Mode)
-    # Default is 1.5 MB (~375K tokens), which safely fits in Gemini's 1M+ token window
-    # while leaving plenty of headroom for the PR diff/patch and structured outputs.
-    max_context_bytes = config.get("max_context_bytes", 1500 * 1024)
-    if "GEMINI_MAX_CONTEXT_BYTES" in os.environ:
-        try:
-            max_context_bytes = int(os.environ["GEMINI_MAX_CONTEXT_BYTES"])
-        except ValueError:
-            pass
-
-    core_patterns = config.get("core_file_patterns", [
-        # Documentation
-        "*.md",
-        # Python
-        "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile",
-        # JavaScript / TypeScript / Node
-        "package.json", "tsconfig.json",
-        # Go
-        "go.mod",
-        # Rust
-        "Cargo.toml",
-        # Java / Kotlin
-        "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
-        # Ruby
-        "Gemfile", "*.gemspec",
-        # PHP
-        "composer.json",
-        # C# / .NET
-        "*.csproj", "*.sln",
-        # Swift / Objective-C
-        "Package.swift", "Podfile",
-        # Docker / Infrastructure
-        "Dockerfile", "docker-compose.yml",
-        # Configuration
-        "gemini-review.toml", "action.yml"
-    ])
-
-    repo_files = get_all_repo_files()
-    other_files = [f for f in repo_files if f not in pr_filenames]
-    print(f"Codebase context: found {len(repo_files)} total tracked files, {len(other_files)} other files (excluding PR diff files).", file=sys.stderr)
-
-    if other_files:
-        total_size = 0
-        file_sizes = {}
-        for f in other_files:
-            try:
-                size = os.path.getsize(f)
-                file_sizes[f] = size
-                total_size += size
-            except Exception:
-                continue
-
-        print(f"Codebase context: total size of other text files is {total_size} bytes (limit is {max_context_bytes} bytes).", file=sys.stderr)
-
-        if total_size <= max_context_bytes:
-            print("Codebase context: running in Full Context Mode (attaching all repository text files).", file=sys.stderr)
-            prompt_parts.append("=== Repository Context (Full Codebase) ===")
-            prompt_parts.append("Below are the contents of all other files in this repository for context:\n")
-            for f in other_files:
-                content = get_file_content(f)
-                if content:
-                    prompt_parts.append(f"--- File: {f} ---")
-                    prompt_parts.append(content)
-                    prompt_parts.append("-----------------\n")
-            prompt_parts.append("=========================================\n")
-        else:
-            print("Codebase context: running in Sparse Context Mode (attaching file tree and core manifests/documentation).", file=sys.stderr)
-            prompt_parts.append("=== Repository Context (Large Codebase) ===")
-            prompt_parts.append("Because this codebase is large, we have included the project file structure and key configuration/documentation files for context:\n")
-
-            full_tree_files = list(pr_filenames.union(set(other_files)))
-            file_tree = generate_file_tree(full_tree_files)
-            prompt_parts.append("--- Repository File Structure ---")
-            prompt_parts.append(file_tree)
-            prompt_parts.append("---------------------------------\n")
-
-            prompt_parts.append("--- Key Configuration and Documentation Files ---")
-            core_files_included = []
-            for f in other_files:
-                if is_core_file(f, core_patterns):
-                    content = get_file_content(f)
-                    if content:
-                        prompt_parts.append(f"--- File: {f} ---")
-                        prompt_parts.append(content)
-                        prompt_parts.append("-----------------\n")
-                        core_files_included.append(f)
-            if core_files_included:
-                print(f"Codebase context: attached {len(core_files_included)} core configuration/documentation files: {', '.join(core_files_included)}", file=sys.stderr)
-            else:
-                prompt_parts.append("(No additional key configuration or documentation files found.)\n")
-                print("Codebase context: no core files matched or found.", file=sys.stderr)
-            prompt_parts.append("==========================================\n")
-
-    return "\n".join(prompt_parts)
-
-
-def post_review(repository: str, pr_number: int, commit_id: str, review: ReviewResult, headers: dict, timeout: int = DEFAULT_TIMEOUT) -> None:
-    """Submit review comments atomically or fall back to individual comments if needed."""
-    comments_payload = []
-    for c in review.comments:
-        body_parts = [f"{c.severity} {c.comment_text}"]
-        if c.code_suggestion:
-            body_parts.append(f"```suggestion\n{c.code_suggestion}\n```")
-
-        comments_payload.append({
-            "path": c.path,
-            "line": c.line,
-            "side": c.side,
-            "body": "\n\n".join(body_parts)
-        })
-
-    review_body = f"## 📋 Review Summary\n\n{review.summary}\n\n## 🔍 General Feedback\n\n" + "\n".join(f"- {f}" for f in review.general_feedback)
-
-    payload = {
-        "body": review_body,
-        "event": "COMMENT",
-        "comments": comments_payload
-    }
-
-    url = f"https://api.github.com/repos/{repository}/pulls/{pr_number}/reviews"
-    print(f"Submitting review to PR #{pr_number} on {repository}...", file=sys.stderr)
-    res = requests.post(url, headers=headers, json=payload, timeout=timeout)
-
-    if res.status_code in (200, 201):
-        print("Successfully posted PR review atomically.", file=sys.stderr)
-        return
-
-    print(f"Warning: Failed to submit review atomically (status {res.status_code}). Error: {res.text}", file=sys.stderr)
-    print("Falling back to posting summary and comments individually...", file=sys.stderr)
-
-    # 1. Post review summary as a single comment on the PR conversation
-    issue_url = f"https://api.github.com/repos/{repository}/issues/{pr_number}/comments"
-    res_summary = requests.post(issue_url, headers=headers, json={"body": review_body}, timeout=timeout)
-    if res_summary.status_code not in (200, 201):
-        print(f"Error posting review summary comment: {res_summary.status_code} - {res_summary.text}", file=sys.stderr)
-
-    # 2. Post inline comments one by one
-    comments_url = f"https://api.github.com/repos/{repository}/pulls/{pr_number}/comments"
-    for idx, c in enumerate(comments_payload):
-        c_payload = {
-            "body": c["body"],
-            "commit_id": commit_id,
-            "path": c["path"],
-            "line": c["line"],
-            "side": c["side"]
-        }
-        res_comment = requests.post(comments_url, headers=headers, json=c_payload, timeout=timeout)
-        if res_comment.status_code in (200, 201):
-            print(f"Posted comment {idx+1}/{len(comments_payload)} successfully.", file=sys.stderr)
-        else:
-            print(f"Error posting comment {idx+1} on {c['path']} (line {c['line']}): {res_comment.status_code} - {res_comment.text}", file=sys.stderr)
+def __getattr__(name: str):
+    """Fallback to gemini_review for backward compatibility and test mock resolution."""
+    return getattr(gr, name)
 
 
 def main():
@@ -473,12 +41,12 @@ def main():
     use_vertexai = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "False").lower() in ("true", "1")
     project = os.environ.get("GOOGLE_CLOUD_PROJECT")
     location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-    model_name = os.environ.get("GEMINI_MODEL", os.environ.get("MODEL", "gemini-3.5-flash"))
+    model_name = gr.get_default_model()
 
     try:
-        timeout = int(os.environ.get("GEMINI_TIMEOUT", str(DEFAULT_TIMEOUT)))
+        timeout = int(os.environ.get("GEMINI_TIMEOUT", str(gr.DEFAULT_TIMEOUT)))
     except ValueError:
-        timeout = DEFAULT_TIMEOUT
+        timeout = gr.DEFAULT_TIMEOUT
 
     headers = {}
     if github_token:
@@ -503,6 +71,16 @@ def main():
         if event_name == "pull_request":
             pr_number = event_payload["pull_request"]["number"]
             head_sha = event_payload["pull_request"]["head"]["sha"]
+
+            skip_suggestions = os.environ.get("GEMINI_SKIP_INLINE_SUGGESTIONS", "true").lower() in ("true", "1")
+
+            if skip_suggestions and gr.is_inline_suggestion_commit(repository, head_sha, headers, timeout=timeout):
+                print(
+                    f"Head commit {head_sha[:7]} was created by accepting an inline suggestion via GitHub UI. "
+                    "Skipping automated re-review to avoid unnecessary review noise.",
+                    file=sys.stderr,
+                )
+                sys.exit(0)
         elif event_name == "issue_comment":
             comment_body = event_payload["comment"]["body"].strip()
             if not comment_body.startswith("/gemini-review"):
@@ -512,7 +90,10 @@ def main():
             author_association = event_payload["comment"]["author_association"]
             allowed_associations = {"OWNER", "MEMBER", "COLLABORATOR"}
             if author_association not in allowed_associations:
-                print(f"User association '{author_association}' not authorized to trigger code review. Exiting.", file=sys.stderr)
+                print(
+                    f"User association '{author_association}' not authorized to trigger code review. Exiting.",
+                    file=sys.stderr,
+                )
                 sys.exit(0)
 
             if "pull_request" not in event_payload["issue"]:
@@ -534,17 +115,17 @@ def main():
     # Gather file patches and full contents
     if is_dry_run:
         print("Gathering files from local git tree...", file=sys.stderr)
-        files = get_local_git_files()
+        files = gr.get_local_git_files()
     else:
         print(f"Fetching files for PR #{pr_number} from GitHub API...", file=sys.stderr)
-        files = get_pr_files(repository, pr_number, headers, timeout=timeout)
+        files = gr.get_pr_files(repository, pr_number, headers, timeout=timeout)
 
     if not files:
         print("No files modified in this PR. Exiting.", file=sys.stderr)
         sys.exit(0)
 
     # Filter out excluded file types
-    text_files = [f for f in files if is_text_file(f["filename"])]
+    text_files = [f for f in files if gr.is_text_file(f["filename"])]
     if not text_files:
         print("No text-based files to review. Exiting.", file=sys.stderr)
         sys.exit(0)
@@ -554,32 +135,273 @@ def main():
         print(f"Initialising GenAI Client (Model: {model_name}) using Vertex AI authentication...", file=sys.stderr)
         client = genai.Client(vertexai=True, project=project, location=location)
     else:
-        print(f"Initialising GenAI Client (Model: {model_name}) using Google AI Studio API Key authentication...", file=sys.stderr)
+        print(
+            f"Initialising GenAI Client (Model: {model_name}) using Google AI Studio API Key authentication...",
+            file=sys.stderr,
+        )
         client = genai.Client(api_key=gemini_api_key)
 
-    config = load_config()
-    system_instruction = load_system_instruction(repository, pr_number, config)
-    prompt_context = build_prompt(text_files, config)
+    config = gr.load_config()
+
+    # Cost attribution. Vertex attaches these to the billed charge so spend can be grouped
+    # by repository in the Cloud Billing export; returns None on the API-key path, where the
+    # API has no labels field at all.
+    billing_labels = gr.build_labels(client, config, repository)
+    if billing_labels:
+        print(f"Billing labels: {billing_labels}", file=sys.stderr)
+    system_instruction = gr.load_system_instruction(repository, pr_number, config)
+
+    # Load workspace rules (AGENTS.md, etc.)
+    workspace_rules = gr.load_workspace_rules()
+    if workspace_rules:
+        system_instruction += f"\n\n## Project Rules & Best Practices:\n{workspace_rules}"
+
+    # Assemble tools list
+    tools = [gr.list_available_skills, gr.load_skill_instructions]
+    auth_headers = gr.get_google_auth_headers()
+    disable_dev_k = os.environ.get("DISABLE_DEVELOPER_KNOWLEDGE", "false").lower() == "true"
+    has_dev_knowledge = bool(
+        not disable_dev_k and auth_headers and ("X-Goog-Api-Key" in auth_headers or "Authorization" in auth_headers)
+    )
+    if has_dev_knowledge:
+        print("Registering Google Developer Knowledge MCP tools...", file=sys.stderr)
+        tools.extend([gr.search_google_developer_knowledge, gr.get_google_developer_documents])
+
+    # Add tools info to system instruction
+    system_instruction += "\n\n## Tools Availability:"
+    system_instruction += (
+        "\n- You have workspace skill tools: `list_available_skills` and `load_skill_instructions` to find and load"
+        " local project guidelines."
+    )
+    if has_dev_knowledge:
+        system_instruction += (
+            "\n- You have Google Developer Knowledge search tools: `search_google_developer_knowledge` and"
+            " `get_google_developer_documents` to query official Google APIs, Google Cloud, Firebase, and other"
+            " developer docs."
+        )
+
+    include_comments_env = os.environ.get("GEMINI_INCLUDE_COMMENT_HISTORY", "true").lower() in ("true", "1")
+    include_comments_config = config.get("include_comment_history", True)
+    should_include_comments = include_comments_env and include_comments_config
+
+    comment_history_str = ""
+    comment_history_tokens = 0
+    if should_include_comments and not is_dry_run and repository and pr_number:
+        print(f"Fetching prior PR comments for PR #{pr_number}...", file=sys.stderr)
+        review_comments, issue_comments = gr.get_pr_comments(repository, pr_number, headers, timeout=timeout)
+        excluded_authors = gr.parse_excluded_authors(os.environ.get("GEMINI_EXCLUDE_COMMENT_AUTHORS"))
+        if excluded_authors:
+            print(f"Comment history: excluding authors {sorted(excluded_authors)}.", file=sys.stderr)
+        comment_history_str = gr.format_pr_comment_history(review_comments, issue_comments, excluded_authors)
+        if comment_history_str:
+            comment_history_tokens = gr.count_text_tokens(client, model_name, comment_history_str)
+            print(
+                f"PR comment history included ({comment_history_tokens:,} tokens).",
+                file=sys.stderr,
+            )
+
+    pr_diff_prompt = gr.build_pr_diff_prompt(text_files, config)
+    dynamic_pr_prompt = f"{pr_diff_prompt}\n\n{comment_history_str}" if comment_history_str else pr_diff_prompt
+    codebase_context = gr.build_codebase_context(text_files, config, client=client, model=model_name)
+
+    full_prompt = f"{dynamic_pr_prompt}\n\n{codebase_context}" if codebase_context else dynamic_pr_prompt
+
+    # Backstop. Per-file caps stop ONE huge file taking the review down; they cannot stop
+    # many files each under the cap. Check here rather than letting the API reject it: a
+    # 400 costs the entire review and posts nothing, whereas dropping repository context
+    # still produces a real review of the diff.
+    budget = gr.prompt_token_budget(model_name, config)
+    prompt_tokens = gr.count_text_tokens(client, model_name, full_prompt)
+    if prompt_tokens > budget and codebase_context:
+        print(
+            f"Context budget: prompt is {prompt_tokens:,} tokens against a budget of {budget:,}. "
+            "Dropping repository context and reviewing the diff alone.",
+            file=sys.stderr,
+        )
+        codebase_context = ""
+        full_prompt = dynamic_pr_prompt
+        prompt_tokens = gr.count_text_tokens(client, model_name, full_prompt)
+
+    if prompt_tokens > budget:
+        print(
+            f"Context budget: the PR diff alone is {prompt_tokens:,} tokens, over the {budget:,} budget for "
+            "this model. Lower GEMINI_MAX_FILE_BYTES, raise GEMINI_MAX_PROMPT_TOKENS, or split the PR.",
+            file=sys.stderr,
+        )
+
+    enable_caching = config.get("enable_context_caching", True)
+    cache_ttl_seconds = config.get("cache_ttl_seconds", 3600)
+    cache_ttl = f"{cache_ttl_seconds}s"
+
+    cached_content_name = None
+    contents_to_send = full_prompt
+
+    if enable_caching and hasattr(client, "caches") and codebase_context:
+        try:
+            # Gemini Context Caching requires minimum 32,768 tokens (approx 100,000+ characters)
+            if len(codebase_context) > 100000:
+                clean_repo = repository.replace("/", "-").replace("\\", "-") if repository else "repo"
+                clean_model = gr._normalize_model_name(model_name).replace("/", "-").replace("\\", "-")
+                clean_persona = gr.resolve_persona_name(config).lower().replace("/", "-").replace("\\", "-")
+                display_name = f"repo-cache-{clean_repo}-{clean_model}-{clean_persona}"
+
+                # Check if an active cache already exists matching display_name and model_name
+                existing_cache = None
+                try:
+                    active_caches = client.caches.list()
+                    for cache_item in active_caches:
+                        item_display_name = getattr(cache_item, "display_name", None)
+                        if item_display_name == display_name:
+                            item_model = getattr(cache_item, "model", None)
+                            if isinstance(item_model, str) and gr._normalize_model_name(
+                                item_model
+                            ) != gr._normalize_model_name(model_name):
+                                print(
+                                    f"Notice: Found cache ({item_display_name}: {cache_item.name}) "
+                                    f"for a different model ('{item_model}', expected '{model_name}'). "
+                                    "Skipping cache reuse.",
+                                    file=sys.stderr,
+                                )
+                                continue
+                            existing_cache = cache_item
+                            break
+                except Exception as list_err:
+                    print(f"Notice: Cache listing failed ({list_err}), creating fresh cache.", file=sys.stderr)
+
+                if existing_cache:
+                    cached_content_name = existing_cache.name
+                    contents_to_send = dynamic_pr_prompt
+                    active_display_name = getattr(existing_cache, "display_name", display_name)
+                    print(
+                        f"Reusing active Gemini context cache ({active_display_name}: {cached_content_name})...",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"Creating Gemini context cache ({display_name})...", file=sys.stderr)
+                    parsed_tools = None
+                    if tools:
+                        try:
+                            parsed_cfg = client.models._parse_config(types.GenerateContentConfig(tools=tools))
+                            parsed_tools = parsed_cfg.tools
+                        except Exception:
+                            parsed_tools = None
+
+                    cache_obj = client.caches.create(
+                        model=model_name,
+                        config=types.CreateCachedContentConfig(
+                            contents=[codebase_context],
+                            display_name=display_name,
+                            system_instruction=system_instruction,
+                            tools=parsed_tools,
+                            ttl=cache_ttl,
+                        ),
+                    )
+                    cached_content_name = cache_obj.name
+                    contents_to_send = dynamic_pr_prompt
+                    print(f"Context cache active: {cached_content_name}", file=sys.stderr)
+        except Exception as e:
+            print(
+                f"Warning: Context caching unavailable or skipped ({e}). Proceeding with direct context.",
+                file=sys.stderr,
+            )
+            cached_content_name = None
+            contents_to_send = full_prompt
+
+    if cached_content_name:
+        gen_config = types.GenerateContentConfig(
+            cached_content=cached_content_name,
+            response_mime_type="application/json",
+            response_schema=gr.ReviewResult,
+            labels=billing_labels,
+        )
+    else:
+        gen_config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=tools,
+            response_mime_type="application/json",
+            response_schema=gr.ReviewResult,
+            labels=billing_labels,
+        )
 
     print("Generating code review...", file=sys.stderr)
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt_context,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-            response_schema=ReviewResult,
+
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=contents_to_send,
+            config=gen_config,
         )
-    )
+    except Exception as gen_err:
+        if cached_content_name:
+            print(
+                f"Warning: generate_content with cached content failed ({gen_err}). "
+                "Falling back to direct context generation...",
+                file=sys.stderr,
+            )
+            cached_content_name = None
+            contents_to_send = full_prompt
+            gen_config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=tools,
+                response_mime_type="application/json",
+                response_schema=gr.ReviewResult,
+                labels=billing_labels,
+            )
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents_to_send,
+                config=gen_config,
+            )
+        else:
+            raise
 
-    review_data = json.loads(response.text)
-    review = ReviewResult(**review_data)
-    review = filter_review_comments(review, text_files)
+    usage_dict = None
+    if response.usage_metadata:
+        usage = response.usage_metadata
+        prompt_tokens = usage.prompt_token_count or 0
+        cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
+        candidates_tokens = usage.candidates_token_count or 0
+        total_tokens = usage.total_token_count or 0
 
+        fresh_tokens = max(0, prompt_tokens - cached_tokens - comment_history_tokens)
+        cache_percentage = (cached_tokens / prompt_tokens * 100) if prompt_tokens > 0 else 0.0
+
+        usage_dict = {
+            "prompt_tokens": prompt_tokens,
+            "cached_tokens": cached_tokens,
+            "candidates_tokens": candidates_tokens,
+            "comment_history_tokens": comment_history_tokens,
+            "fresh_tokens": fresh_tokens,
+            "total_tokens": total_tokens,
+            "cache_percentage": cache_percentage,
+            # Recorded so the telemetry can be priced. Without it the table can only
+            # show tokens, which is what it did before this was added.
+            "model": model_name,
+        }
+
+        cache_str = f" ({cache_percentage:.1f}% cached)" if cached_tokens > 0 else ""
+        cost = gr.estimate_cost(usage_dict, model_name, config)
+        cost_str = f" Estimated cost: {gr.usd(cost.total)}." if cost.rate else " No rate entry for this model."
+        print(
+            f"Token Usage: {prompt_tokens:,d} input tokens{cache_str}, {candidates_tokens:,d} output tokens."
+            f" Total: {total_tokens:,d} tokens.{cost_str}",
+            file=sys.stderr,
+        )
+
+    response_text = gr.extract_response_text_or_raise(response)
+    review_data = json.loads(response_text)
+
+    review = gr.ReviewResult(**review_data)
+    review = gr.filter_review_comments(review, text_files)
 
     if is_dry_run:
         print("\n=== DRY RUN REVIEW SUMMARY ===", file=sys.stderr)
         print(f"Summary: {review.summary}")
+        if review.resolved_items:
+            print("\n=== RESOLVED ITEMS ===", file=sys.stderr)
+            for r in review.resolved_items:
+                loc = f" ({r.path}:{r.line})" if getattr(r, "path", None) and getattr(r, "line", None) else ""
+                print(f"✅ {getattr(r, 'description', r)}{loc}")
         print("\n=== GENERAL FEEDBACK ===", file=sys.stderr)
         for gf in review.general_feedback:
             print(f"- {gf}")
@@ -588,7 +410,36 @@ def main():
             suggestion_str = f"\nSuggestion:\n{c.code_suggestion}" if c.code_suggestion else ""
             print(f"File: {c.path}:{c.line} ({c.side}) - Severity: {c.severity}\n{c.comment_text}{suggestion_str}\n")
     else:
-        post_review(repository, pr_number, head_sha, review, headers, timeout=timeout)
+        gr.post_review(
+            repository,
+            pr_number,
+            head_sha,
+            review,
+            headers,
+            timeout=timeout,
+            usage_metadata=usage_dict,
+            config=config,
+            event_name=event_name,
+        )
+
+        # After the review is posted, not before: resolving threads must never be able to cost us
+        # the review itself, so it runs last and every failure inside it is a warning.
+        if os.environ.get("GEMINI_RESOLVE_ADDRESSED_THREADS", "false").lower() in ("true", "1"):
+            if review.resolved_items:
+                gr.resolve_addressed_threads(
+                    repository,
+                    pr_number,
+                    headers,
+                    review.resolved_items,
+                    bot_logins=gr.reviewer_logins(),
+                    timeout=timeout,
+                )
+        elif review.resolved_items:
+            print(
+                "Note: items were reported as resolved but their threads were left open. "
+                "Set resolve_addressed_threads: true to close them automatically.",
+                file=sys.stderr,
+            )
 
 
 if __name__ == "__main__":
