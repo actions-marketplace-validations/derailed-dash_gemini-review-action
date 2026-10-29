@@ -11,16 +11,29 @@ This repository contains the codebase for the **Gemini Code Review & Issue Triag
 - **Input Parameters in Workflow YAML**: All operational configuration parameters (such as `skip_inline_suggestions`, `include_comment_history`, `language`, `persona`, `timeout`) MUST be configured via action input parameters in `action.yml`, workflow `.yml` files, and environment variables (`GEMINI_*`).
 - **TOML Configuration Scope**: `gemini-review.toml` is strictly reserved for prompt text templates and custom system prompt overrides. Operational configuration parameters must NOT be placed in `gemini-review.toml`.
 
+## Review Agent Instructions vs Repository Project Context
+
+When designing or modifying review prompts and context assembly:
+- **Reviewer Custom Instructions (System Prompt)**:
+  - Custom instructions to guide the PR review agent (persona, tone, extra review rules) MUST strictly come from `.github/review-instruction-additions.md` (or root `review-instruction-additions.md` fallback).
+  - These are loaded via `load_custom_instructions()` and appended to Gemini's system instructions.
+  - General repository guideline files like `AGENTS.md` or `GEMINI.md` MUST NOT be loaded into `load_custom_instructions()` or the reviewer's system prompt.
+- **Repository Project Context (User Prompt / Diff Context)**:
+  - Files like `AGENTS.md`, `GEMINI.md`, and `CLAUDE.md` represent repository guidelines, coding standards, and project rules.
+  - They MUST be attached as **project context** alongside the diff (in `build_codebase_context()`) so the model understands the project's rules when evaluating code changes.
+  - In sparse context mode, they are prioritised at the very top of `candidate_core_files` so they are never squeezed out by byte limits.
+
 ## Python Guidelines
 
 - **Python Version**: Target Python >=3.13.
 - **Type Hinting**: Use modern PEP 585 built-in types (e.g. use lowercase `list`, `dict`, `tuple` instead of importing from `typing`).
-- **Formatting and Lints**: Always format and check code using `ruff` and `codespell` from the root of the project:
+- **Formatting, Lints, and Type Checking**: Always format, lint, and type-check code using `codespell`, `ruff`, and `pyright` from the root of the project:
   ```bash
   uvx codespell@latest -s
   uvx ruff@latest format .
   uvx ruff@latest check --fix .
   uvx ruff@latest format --check .
+  uvx pyright@latest
   ```
 
 ## Security & Path Integrity
@@ -33,6 +46,14 @@ This repository contains the codebase for the **Gemini Code Review & Issue Triag
 - **Coverage**: Any new helper functions, tool implementations, or configuration loaders must be accompanied by comprehensive tests in the `tests/` directory.
 - **Mocking**: Properly mock all external network requests (such as GitHub API endpoints or the Google Developer Knowledge MCP JSON-RPC service).
 
+## Multimodal Context & Visual Diffing Standards
+
+- **Single-Turn Cross-Attention**: Always pass baseline (`base_sha`) and head (`head_sha`) images together in a single Gemini request as sequential `types.Part` elements so the model evaluates visual changes via direct cross-attention without lossy intermediate text summaries.
+- **Image Downscaling Thresholds**: All raster images exceeding `image_trigger_bytes` (default: 600 KB) MUST be downscaled via `optimize_image_bytes()` using Lanczos resampling towards `image_target_bytes` (default: 300 KB). SVGs and PDFs MUST pass through uncompressed.
+- **Path Traversal on Dynamic Markdown References**: When extracting image links from markdown (`extract_markdown_image_references()`), always enforce `os.path.commonpath` containment against the workspace root before reading image blobs.
+- **Remote Triage Screenshot Security**: When fetching remote screenshots for issue triage (`fetch_remote_image()`), strictly require `https://`, reject loopback/private/metadata hosts, cap downloads at `max_triage_images` (default: 5), and only attach `Authorization: Bearer <GITHUB_TOKEN>` to trusted GitHub domains (`github.com`, `githubusercontent.com`).
+
+
 ## Local Execution & Testing Guidance
 
 If you are asked to run a review locally, be sure to present the actual review output back to the user, as well as your relevant conclusions following the review execution.
@@ -42,9 +63,9 @@ To execute `gemini_pr_review.py` or `gemini_issue_triage.py` locally for testing
 1. **Environment Variables**:
    Load `GEMINI_API_KEY` dynamically from the local `.env` file before invoking Python (do NOT hardcode API key values):
    ```bash
-   export GEMINI_API_KEY=$(grep '^GEMINI_API_KEY=' .env | cut -d= -f2- | tr -d '"' | tr -d "'")
+   export GEMINI_API_KEY=$(grep -E '^(export[[:space:]]+)?GEMINI_API_KEY=' .env | cut -d= -f2- | tr -d '"' | tr -d "'")
    ```
-   If a `.env` file is not available, ask the user for the key.
+   Alternatively, if `.env` already uses `export GEMINI_API_KEY=...`, you can run `source .env` or pass `--env-file .env` to `uv run`. If a `.env` file is not available, ask the user for the key.
 
    
 2. **Git Diff Context for Local PR Reviews**:
@@ -52,7 +73,7 @@ To execute `gemini_pr_review.py` or `gemini_issue_triage.py` locally for testing
    - To review uncommitted or untracked local changes during dry-run testing, either stage the changes (`git add .`) or pass a mock diff in a short Python launcher script. The user may have forgotten to stage untracked changes.
 
 3. **Execution Command**:
-   - Always run using the virtual environment interpreter (`.venv/bin/python`) or `uv run python`.
+   - Always run using the virtual environment interpreter (`.venv/bin/python`) or `uv run --locked --project . python`.
    - Set `WaitMsBeforeAsync: 10000` (10 seconds) on `run_command` calls to allow the LLM response generation and Developer Knowledge API lookup to complete synchronously within the turn.
 
 4. **Context Cache Testing & Verification**:
@@ -62,8 +83,24 @@ To execute `gemini_pr_review.py` or `gemini_issue_triage.py` locally for testing
 
 ALWAYS count exactly how many times you executed a review, to allow the user to cross reference invocations against costs and token usage.
 
+## Installation Skill Synchronisation (`install-gemini-code-review-action`)
+
+- **Canonical Source & Local Workspace Copy**:
+  - The `install-gemini-code-review-action` skill is canonically hosted in `derailed-dash/dazbo-agent-skills` (`../dazbo-agent-skills/skills/install-gemini-code-review-action/SKILL.md`), and mirrored in this repository at [.agents/skills/install-gemini-code-review-action/SKILL.md](.agents/skills/install-gemini-code-review-action/SKILL.md) so users can also install it directly via `npx skills add derailed-dash/gemini-review-action --skill install-gemini-code-review-action`.
+- **Keeping the Skill in Sync**:
+  - **When modifying action inputs, personas, or workflow templates here**: Update [.agents/skills/install-gemini-code-review-action/SKILL.md](.agents/skills/install-gemini-code-review-action/SKILL.md) in the same PR (enforced by `tests/test_skill_sync.py`), and copy the updated `SKILL.md` across to the canonical `../dazbo-agent-skills/skills/install-gemini-code-review-action/SKILL.md` repository (and `~/.gemini/config/skills/install-gemini-code-review-action/SKILL.md` if present).
+  - **When pulling upstream updates from the canonical skills repo**: Copy from `../dazbo-agent-skills/skills/install-gemini-code-review-action/SKILL.md` (or run `npx skills update -g -y && ./scripts/sync_skills.sh`) into [.agents/skills/install-gemini-code-review-action/SKILL.md](.agents/skills/install-gemini-code-review-action/SKILL.md).
+
+## Pushing to GitHub
+
+Before pushing a change of anything non-trivial:
+- Check if any documentation should be updated based on this PR and update accordingly. This includes (but is not limited to) README.md, AGENTS.md, ARCHITECTURE.md, and [.agents/skills/install-gemini-code-review-action/SKILL.md](.agents/skills/install-gemini-code-review-action/SKILL.md) (plus syncing back to `../dazbo-agent-skills`).
+- Update the version number in `pyproject.toml` and run `uv lock` (because `action.yml` enforces `uv run --locked`, `uv.lock` MUST stay synchronised with `pyproject.toml`). Verify your proposed new version number before proceeding.
+
 ## Release Notes & Tagging Standards
 
 When preparing GitHub releases:
 - **Rolled-In Highlights with Collapsible Drop-Downs**: In release notes, roll in summaries of previous recent releases under `## 📜 Rolled-In Highlights from Previous Releases` using collapsible HTML `<details><summary><strong>vX.Y.Z: Title</strong></summary>...</details>` blocks (following the v1.6.1 style).
 - **Floating Tag Maintenance**: Always create the specific versioned tag (e.g. `v1.6.3`) AND force-update the major floating tag (e.g. `git tag -fa v1 -m "Update v1 tag to v1.6.3" && git push origin v1 --force`) so standard action consumers tracking `@v1` automatically receive updates.
+
+

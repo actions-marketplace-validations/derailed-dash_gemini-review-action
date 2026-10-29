@@ -1,10 +1,3 @@
-# /// script
-# dependencies = [
-#   "google-genai>=2.12.1",
-#   "requests",
-#   "pydantic",
-# ]
-# ///
 #!/usr/bin/env python3
 """
 Description: Runs a Pull Request code review using the Google GenAI SDK.
@@ -19,6 +12,7 @@ for the workflow run.
 import json
 import os
 import sys
+from typing import Any
 
 import requests
 from google import genai
@@ -35,7 +29,7 @@ def __getattr__(name: str):
 def main():
     github_token = os.environ.get("GITHUB_TOKEN")
     gemini_api_key = os.environ.get("GEMINI_API_KEY")
-    repository = os.environ.get("GITHUB_REPOSITORY")
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
     event_path = os.environ.get("GITHUB_EVENT_PATH")
 
     use_vertexai = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "False").lower() in ("true", "1")
@@ -59,6 +53,8 @@ def main():
     is_dry_run = False
     pr_number = 1
     head_sha = "mock_head_sha"
+    base_sha = "main"
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "pull_request")
 
     if not event_path or not os.path.exists(event_path):
         print("Warning: GITHUB_EVENT_PATH not set or not found. Running in dry-run/mock mode.", file=sys.stderr)
@@ -71,6 +67,7 @@ def main():
         if event_name == "pull_request":
             pr_number = event_payload["pull_request"]["number"]
             head_sha = event_payload["pull_request"]["head"]["sha"]
+            base_sha = event_payload["pull_request"].get("base", {}).get("sha", "main")
 
             skip_suggestions = os.environ.get("GEMINI_SKIP_INLINE_SUGGESTIONS", "true").lower() in ("true", "1")
 
@@ -108,6 +105,7 @@ def main():
                 sys.exit(1)
             pr_data = res.json()
             head_sha = pr_data["head"]["sha"]
+            base_sha = pr_data.get("base", {}).get("sha", "main")
         else:
             print(f"Unsupported event type: {event_name}. Running in dry-run mode.", file=sys.stderr)
             is_dry_run = True
@@ -124,10 +122,11 @@ def main():
         print("No files modified in this PR. Exiting.", file=sys.stderr)
         sys.exit(0)
 
-    # Filter out excluded file types
+    # Filter text and image files
     text_files = [f for f in files if gr.is_text_file(f["filename"])]
-    if not text_files:
-        print("No text-based files to review. Exiting.", file=sys.stderr)
+    image_files = [f for f in files if gr.is_supported_image(f["filename"])]
+    if not text_files and not image_files:
+        print("No text-based or visual image files to review. Exiting.", file=sys.stderr)
         sys.exit(0)
 
     # Initialise Gemini client
@@ -203,27 +202,57 @@ def main():
                 file=sys.stderr,
             )
 
+    visual_diff_summary = ""
+    visual_diff_parts: list[Any] = []
+    if image_files:
+        print(f"Detected {len(image_files)} changed image file(s). Generating visual diff parts...", file=sys.stderr)
+        visual_diff_summary, visual_diff_parts = gr.build_visual_diff_parts(
+            image_files,
+            base_sha=base_sha,
+            repository=repository,
+            headers=headers,
+            config=config,
+            timeout=timeout,
+            head_sha=head_sha,
+        )
+
     pr_diff_prompt = gr.build_pr_diff_prompt(text_files, config)
+    if visual_diff_summary:
+        pr_diff_prompt = f"{pr_diff_prompt}\n\n### Changed Visual Image Assets in PR:\n{visual_diff_summary}"
     dynamic_pr_prompt = f"{pr_diff_prompt}\n\n{comment_history_str}" if comment_history_str else pr_diff_prompt
-    codebase_context = gr.build_codebase_context(text_files, config, client=client, model=model_name)
+    context_telemetry: dict[str, Any] = {}
+    codebase_multimodal_parts: list[Any] = []
+    codebase_context = gr.build_codebase_context(
+        text_files,
+        config,
+        client=client,
+        model=model_name,
+        context_telemetry=context_telemetry,
+        multimodal_parts=codebase_multimodal_parts,
+    )
 
     full_prompt = f"{dynamic_pr_prompt}\n\n{codebase_context}" if codebase_context else dynamic_pr_prompt
+    all_multimodal_parts = visual_diff_parts + codebase_multimodal_parts
+    contents_to_send: Any = [full_prompt] + all_multimodal_parts if all_multimodal_parts else full_prompt
 
     # Backstop. Per-file caps stop ONE huge file taking the review down; they cannot stop
     # many files each under the cap. Check here rather than letting the API reject it: a
     # 400 costs the entire review and posts nothing, whereas dropping repository context
     # still produces a real review of the diff.
     budget = gr.prompt_token_budget(model_name, config)
-    prompt_tokens = gr.count_text_tokens(client, model_name, full_prompt)
-    if prompt_tokens > budget and codebase_context:
+    prompt_tokens = gr.count_text_tokens(client, model_name, contents_to_send)
+    if prompt_tokens > budget and (codebase_context or codebase_multimodal_parts):
         print(
             f"Context budget: prompt is {prompt_tokens:,} tokens against a budget of {budget:,}. "
             "Dropping repository context and reviewing the diff alone.",
             file=sys.stderr,
         )
         codebase_context = ""
+        codebase_multimodal_parts = []
+        all_multimodal_parts = visual_diff_parts
         full_prompt = dynamic_pr_prompt
-        prompt_tokens = gr.count_text_tokens(client, model_name, full_prompt)
+        contents_to_send = [full_prompt] + all_multimodal_parts if all_multimodal_parts else full_prompt
+        prompt_tokens = gr.count_text_tokens(client, model_name, contents_to_send)
 
     if prompt_tokens > budget:
         print(
@@ -237,7 +266,6 @@ def main():
     cache_ttl = f"{cache_ttl_seconds}s"
 
     cached_content_name = None
-    contents_to_send = full_prompt
 
     if enable_caching and hasattr(client, "caches") and codebase_context:
         try:
@@ -284,15 +312,22 @@ def main():
                     parsed_tools = None
                     if tools:
                         try:
-                            parsed_cfg = client.models._parse_config(types.GenerateContentConfig(tools=tools))
-                            parsed_tools = parsed_cfg.tools
+                            parse_fn = getattr(client.models, "_parse_config", None)
+                            if callable(parse_fn):
+                                parsed_cfg = parse_fn(types.GenerateContentConfig(tools=tools))
+                                parsed_tools = getattr(parsed_cfg, "tools", None)
                         except Exception:
                             parsed_tools = None
 
+                    cache_contents: Any = (
+                        [codebase_context] + codebase_multimodal_parts
+                        if codebase_multimodal_parts
+                        else codebase_context
+                    )
                     cache_obj = client.caches.create(
                         model=model_name,
                         config=types.CreateCachedContentConfig(
-                            contents=[codebase_context],
+                            contents=cache_contents,
                             display_name=display_name,
                             system_instruction=system_instruction,
                             tools=parsed_tools,
@@ -300,7 +335,9 @@ def main():
                         ),
                     )
                     cached_content_name = cache_obj.name
-                    contents_to_send = dynamic_pr_prompt
+                    contents_to_send = (
+                        [dynamic_pr_prompt] + visual_diff_parts if visual_diff_parts else dynamic_pr_prompt
+                    )
                     print(f"Context cache active: {cached_content_name}", file=sys.stderr)
         except Exception as e:
             print(
@@ -308,7 +345,10 @@ def main():
                 file=sys.stderr,
             )
             cached_content_name = None
-            contents_to_send = full_prompt
+            contents_to_send = [full_prompt] + all_multimodal_parts if all_multimodal_parts else full_prompt
+
+    thinking_level = config.get("thinking_level") or os.environ.get("GEMINI_THINKING_LEVEL")
+    thinking_cfg = gr.build_thinking_config(thinking_level)
 
     if cached_content_name:
         gen_config = types.GenerateContentConfig(
@@ -316,6 +356,7 @@ def main():
             response_mime_type="application/json",
             response_schema=gr.ReviewResult,
             labels=billing_labels,
+            thinking_config=thinking_cfg,
         )
     else:
         gen_config = types.GenerateContentConfig(
@@ -324,6 +365,7 @@ def main():
             response_mime_type="application/json",
             response_schema=gr.ReviewResult,
             labels=billing_labels,
+            thinking_config=thinking_cfg,
         )
 
     print("Generating code review...", file=sys.stderr)
@@ -335,59 +377,133 @@ def main():
             config=gen_config,
         )
     except Exception as gen_err:
-        if cached_content_name:
+        err_msg = str(gen_err).lower()
+        if gen_config.thinking_config is not None and (
+            "thinking" in err_msg or "400" in err_msg or "invalid_argument" in err_msg
+        ):
+            print(
+                f"Warning: thinking_config not supported by model '{model_name}' ({gen_err}). "
+                "Retrying without thinking_config...",
+                file=sys.stderr,
+            )
+            gen_config.thinking_config = None
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents_to_send,
+                config=gen_config,
+            )
+        elif cached_content_name:
             print(
                 f"Warning: generate_content with cached content failed ({gen_err}). "
                 "Falling back to direct context generation...",
                 file=sys.stderr,
             )
             cached_content_name = None
-            contents_to_send = full_prompt
+            contents_to_send = [full_prompt] + all_multimodal_parts if all_multimodal_parts else full_prompt
             gen_config = types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 tools=tools,
                 response_mime_type="application/json",
                 response_schema=gr.ReviewResult,
                 labels=billing_labels,
+                thinking_config=thinking_cfg,
             )
-            response = client.models.generate_content(
-                model=model_name,
-                contents=contents_to_send,
-                config=gen_config,
-            )
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents_to_send,
+                    config=gen_config,
+                )
+            except Exception as retry_err:
+                r_err_msg = str(retry_err).lower()
+                if gen_config.thinking_config is not None and (
+                    "thinking" in r_err_msg or "400" in r_err_msg or "invalid_argument" in r_err_msg
+                ):
+                    print(
+                        f"Warning: thinking_config rejected ({retry_err}). Retrying without thinking_config...",
+                        file=sys.stderr,
+                    )
+                    gen_config.thinking_config = None
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents_to_send,
+                        config=gen_config,
+                    )
+                else:
+                    raise
         else:
             raise
+
+    direct_contents = [full_prompt] + all_multimodal_parts if all_multimodal_parts else full_prompt
+    response = gr.resolve_tool_calls_loop(
+        client=client,
+        model_name=model_name,
+        initial_contents=contents_to_send,
+        gen_config=gen_config,
+        tools=tools,
+        response=response,
+        fallback_contents=direct_contents,
+        system_instruction=system_instruction,
+        billing_labels=billing_labels,
+        thinking_cfg=gen_config.thinking_config,
+    )
 
     usage_dict = None
     if response.usage_metadata:
         usage = response.usage_metadata
-        prompt_tokens = usage.prompt_token_count or 0
-        cached_tokens = getattr(usage, "cached_content_token_count", 0) or 0
-        candidates_tokens = usage.candidates_token_count or 0
-        total_tokens = usage.total_token_count or 0
+        prompt_raw = getattr(usage, "prompt_token_count", 0)
+        prompt_tokens = int(prompt_raw) if isinstance(prompt_raw, (int, float)) else 0
+        cached_raw = getattr(usage, "cached_content_token_count", 0)
+        cached_tokens = int(cached_raw) if isinstance(cached_raw, (int, float)) else 0
+        candidates_raw = getattr(usage, "candidates_token_count", 0)
+        candidates_tokens = int(candidates_raw) if isinstance(candidates_raw, (int, float)) else 0
+        thoughts_raw = getattr(usage, "thoughts_token_count", 0)
+        thoughts_tokens = int(thoughts_raw) if isinstance(thoughts_raw, (int, float)) else 0
+        total_raw = getattr(usage, "total_token_count", 0)
+        total_tokens = (
+            int(total_raw)
+            if isinstance(total_raw, (int, float))
+            else (prompt_tokens + candidates_tokens + thoughts_tokens)
+        )
 
         fresh_tokens = max(0, prompt_tokens - cached_tokens - comment_history_tokens)
         cache_percentage = (cached_tokens / prompt_tokens * 100) if prompt_tokens > 0 else 0.0
+
+        ctx_prompt_tokens = context_telemetry.get("prompt_tokens", 0)
+        ctx_candidates_tokens = context_telemetry.get("candidates_tokens", 0)
+        ctx_thoughts_tokens = context_telemetry.get("thoughts_tokens", 0)
+        ctx_total_tokens = ctx_prompt_tokens + ctx_candidates_tokens + ctx_thoughts_tokens
+
+        overall_total_tokens = total_tokens + ctx_total_tokens
 
         usage_dict = {
             "prompt_tokens": prompt_tokens,
             "cached_tokens": cached_tokens,
             "candidates_tokens": candidates_tokens,
+            "thoughts_tokens": thoughts_tokens,
+            "total_output_tokens": candidates_tokens + thoughts_tokens,
             "comment_history_tokens": comment_history_tokens,
             "fresh_tokens": fresh_tokens,
-            "total_tokens": total_tokens,
+            "total_tokens": overall_total_tokens,
             "cache_percentage": cache_percentage,
+            "context_selection_prompt_tokens": ctx_prompt_tokens,
+            "context_selection_candidates_tokens": ctx_candidates_tokens,
+            "context_selection_thoughts_tokens": ctx_thoughts_tokens,
+            "context_selection_output_tokens": ctx_candidates_tokens + ctx_thoughts_tokens,
             # Recorded so the telemetry can be priced. Without it the table can only
             # show tokens, which is what it did before this was added.
             "model": model_name,
         }
 
         cache_str = f" ({cache_percentage:.1f}% cached)" if cached_tokens > 0 else ""
+        thoughts_str = f", {thoughts_tokens:,d} thinking tokens" if thoughts_tokens > 0 else ""
+        ctx_str = f" [Dynamic context selection: {ctx_total_tokens:,d} tokens]" if ctx_total_tokens > 0 else ""
         cost = gr.estimate_cost(usage_dict, model_name, config)
         cost_str = f" Estimated cost: {gr.usd(cost.total)}." if cost.rate else " No rate entry for this model."
         print(
-            f"Token Usage: {prompt_tokens:,d} input tokens{cache_str}, {candidates_tokens:,d} output tokens."
-            f" Total: {total_tokens:,d} tokens.{cost_str}",
+            f"Token Usage: {prompt_tokens:,d} input tokens{cache_str}, "
+            f"{candidates_tokens:,d} output tokens{thoughts_str}."
+            f" Total: {overall_total_tokens:,d} tokens{ctx_str}.{cost_str}",
             file=sys.stderr,
         )
 

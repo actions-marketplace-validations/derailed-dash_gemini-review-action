@@ -85,17 +85,57 @@ inputs:
       text or a file path in the repository (defaults to .github/review-instruction-additions.md).
     required: false
     default: '.github/review-instruction-additions.md'
+  thinking_level:
+    description: 'Thinking / reasoning level for Gemini models (e.g. low, high, none, or numeric budget). Controls reasoning token output.'
+    required: false
+    default: ''
+  max_candidate_files:
+    description: 'Maximum number of candidate files considered during dynamic context selection (bounds token overhead in large monorepos).'
+    required: false
+    default: '500'
+  extra_context_files:
+    description: 'Comma-separated static repository files to attach directly to codebase context, bypassing dynamic LLM selection.'
+    required: false
+    default: ''
+  context_diff_directories_only:
+    description: 'Restricts dynamic context selection candidates strictly to directories containing modified files.'
+    required: false
+    default: 'false'
+  context_exclude_patterns:
+    description: 'Comma-separated glob patterns to exclude from codebase context candidate selection.'
+    required: false
+    default: ''
+  max_multimodal_images:
+    description: 'Maximum number of multimodal images (markdown references, static attachments, visual diffs) attached to context.'
+    required: false
+    default: '20'
+  max_triage_images:
+    description: 'Maximum number of remote screenshots attached during issue triage (defaults to 5).'
+    required: false
+    default: '5'
+  image_trigger_bytes:
+    description: 'Byte size threshold above which raster images are downscaled (defaults to 614400 / 600 KB).'
+    required: false
+    default: '614400'
+  image_target_bytes:
+    description: 'Target byte size when downscaling large raster images (defaults to 307200 / 300 KB).'
+    required: false
+    default: '307200'
 
 runs:
   using: 'composite'
   steps:
     - name: Set up Python
-      uses: actions/setup-python@v6
+      # Pinned to the commit the tag points at. A moving major tag means the code that runs in a
+      # consumer's CI can change without the consumer's pin changing.
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
       with:
         python-version: '3.13'
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v5
+      # NOTE: v5 is an annotated tag, so `git rev-parse v5` returns the tag object, not the commit.
+      # This is `git rev-parse v5^{commit}`.
+      uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
     - name: Run Script
       shell: bash
@@ -112,15 +152,24 @@ runs:
         GEMINI_BILLING_LABELS: ${{ inputs.billing_labels }}
         GEMINI_SKIP_INLINE_SUGGESTIONS: ${{ inputs.skip_inline_suggestions }}
         GEMINI_CUSTOM_INSTRUCTIONS: ${{ inputs.custom_instructions }}
+        GEMINI_THINKING_LEVEL: ${{ inputs.thinking_level }}
+        GEMINI_MAX_CANDIDATE_FILES: ${{ inputs.max_candidate_files }}
+        GEMINI_EXTRA_CONTEXT_FILES: ${{ inputs.extra_context_files }}
+        GEMINI_CONTEXT_DIFF_DIRECTORIES_ONLY: ${{ inputs.context_diff_directories_only }}
+        GEMINI_CONTEXT_EXCLUDE_PATTERNS: ${{ inputs.context_exclude_patterns }}
+        GEMINI_MAX_MULTIMODAL_IMAGES: ${{ inputs.max_multimodal_images }}
+        GEMINI_MAX_TRIAGE_IMAGES: ${{ inputs.max_triage_images }}
+        GEMINI_IMAGE_TRIGGER_BYTES: ${{ inputs.image_trigger_bytes }}
+        GEMINI_IMAGE_TARGET_BYTES: ${{ inputs.image_target_bytes }}
         GITHUB_REPOSITORY: ${{ github.repository }}
 
         GITHUB_EVENT_PATH: ${{ github.event_path }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
       run: |
         if [ "${{ inputs.command }}" = "triage" ]; then
-          uv run ${{ github.action_path }}/gemini_issue_triage.py
+          uv run --locked --project "${{ github.action_path }}" python "${{ github.action_path }}/gemini_issue_triage.py"
         else
-          uv run ${{ github.action_path }}/gemini_pr_review.py
+          uv run --locked --project "${{ github.action_path }}" python "${{ github.action_path }}/gemini_pr_review.py"
         fi
 
 branding:

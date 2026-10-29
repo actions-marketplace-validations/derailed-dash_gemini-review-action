@@ -1,67 +1,115 @@
-"""
-Description: General file, git, diff, and text manipulation utilities.
-Provides functions for filtering binary files, parsing diff patches,
-generating repo file trees, and loading workspace agent rules.
+"""General core primitives, token estimation, and facade utilities.
+
+This module provides common primitives (token counting, response extraction,
+workspace rules discovery), while re-exporting functions from the specialised
+multimodal, diff, and repo modules to ensure full backward compatibility.
 """
 
-import fnmatch
 import os
-import re
-import subprocess
 import sys
-from pathlib import PurePosixPath
 from typing import Any
 
-from gemini_review.schemas import InlineComment, ReviewResult
+# Re-export diff & patch parsing utilities
+from gemini_review.diff import (
+    _auto_align_suggestion_indentation,
+    _auto_correct_suggestion_range,
+    filter_review_comments,
+    format_diff_patch_with_line_numbers,
+    format_file_content_with_line_numbers,
+    get_valid_changed_lines,
+    get_valid_diff_lines,
+    sanitize_code_suggestion,
+)
+
+# Re-export multimodal utilities
+from gemini_review.multimodal import (
+    DEFAULT_MAX_REMOTE_IMAGE_BYTES,
+    DEFAULT_MAX_TRIAGE_IMAGES,
+    SUPPORTED_IMAGE_EXTENSIONS,
+    SUPPORTED_MULTIMODAL_EXTENSIONS,
+    build_triage_multimodal_parts,
+    extract_markdown_image_references,
+    extract_remote_image_urls,
+    fetch_remote_image,
+    get_mime_type,
+    is_supported_image,
+    is_supported_multimodal_file,
+    optimize_image_bytes,
+)
+
+# Re-export repository and filesystem utilities
+from gemini_review.repo import (
+    extract_import_references,
+    generate_file_tree,
+    get_all_repo_files,
+    get_file_content,
+    get_git_blob,
+    get_local_git_files,
+    is_core_file,
+    is_text_file,
+    rank_and_bound_candidates,
+)
+
+__all__ = [
+    # Core utils primitives
+    "_get_pr_review_func",
+    "_normalize_model_name",
+    "load_workspace_rules",
+    "count_text_tokens",
+    "extract_response_text_or_raise",
+    "resolve_tool_calls_loop",
+    # Multimodal re-exports
+    "DEFAULT_MAX_REMOTE_IMAGE_BYTES",
+    "DEFAULT_MAX_TRIAGE_IMAGES",
+    "SUPPORTED_IMAGE_EXTENSIONS",
+    "SUPPORTED_MULTIMODAL_EXTENSIONS",
+    "is_supported_image",
+    "is_supported_multimodal_file",
+    "get_mime_type",
+    "optimize_image_bytes",
+    "extract_markdown_image_references",
+    "extract_remote_image_urls",
+    "fetch_remote_image",
+    "build_triage_multimodal_parts",
+    # Diff re-exports
+    "format_file_content_with_line_numbers",
+    "format_diff_patch_with_line_numbers",
+    "get_valid_diff_lines",
+    "get_valid_changed_lines",
+    "_auto_correct_suggestion_range",
+    "_auto_align_suggestion_indentation",
+    "sanitize_code_suggestion",
+    "filter_review_comments",
+    # Repo re-exports
+    "is_text_file",
+    "get_file_content",
+    "get_local_git_files",
+    "get_git_blob",
+    "get_all_repo_files",
+    "is_core_file",
+    "generate_file_tree",
+    "extract_import_references",
+    "rank_and_bound_candidates",
+]
 
 
 def _get_pr_review_func(name: str, fallback: Any) -> Any:
     """Retrieve function from gemini_review or gemini_pr_review if patched to support test mocks."""
-    for mod_name in ("gemini_pr_review", "gemini_review"):
+    for mod_name in (
+        "gemini_pr_review",
+        "gemini_review.prompts",
+        "gemini_review.context",
+        "gemini_review.diff",
+        "gemini_review.repo",
+        "gemini_review.utils",
+        "gemini_review",
+    ):
         mod = sys.modules.get(mod_name)
         if mod and hasattr(mod, name):
             val = getattr(mod, name)
             if val is not fallback:
                 return val
     return fallback
-
-
-def is_text_file(filename: str) -> bool:
-    """Filter out typical binary, lock, and encrypted file formats."""
-    excluded_extensions = {
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".gif",
-        ".ico",
-        ".svg",
-        ".pdf",
-        ".zip",
-        ".tar",
-        ".gz",
-        ".enc",
-        ".lock",
-        ".db",
-        ".pyc",
-        ".o",
-        ".so",
-        ".dylib",
-        ".dll",
-        ".exe",
-        ".woff",
-        ".woff2",
-        ".eot",
-        ".ttf",
-    }
-    _, ext = os.path.splitext(filename.lower())
-    if ext in excluded_extensions:
-        return False
-
-    excluded_names = {"package-lock.json", "uv.lock", ".env", ".env.enc", ".envrc"}
-    if os.path.basename(filename) in excluded_names:
-        return False
-
-    return True
 
 
 def _normalize_model_name(model: str | None) -> str:
@@ -72,429 +120,6 @@ def _normalize_model_name(model: str | None) -> str:
     if "models/" in name:
         name = name.split("models/")[-1]
     return name
-
-
-def format_file_content_with_line_numbers(content: str) -> str:
-    """Format full file content with 1-based line number prefixes."""
-    if not content:
-        return ""
-    lines = content.splitlines()
-    width = max(len(str(len(lines))), 4)
-    return "\n".join(f"{idx:{width}d} | {line}" for idx, line in enumerate(lines, start=1))
-
-
-def format_diff_patch_with_line_numbers(patch: str) -> str:
-    """Annotate unified diff patch lines with their corresponding line numbers."""
-    if not patch:
-        return ""
-
-    annotated_lines = []
-    current_old = 0
-    current_new = 0
-
-    for line in patch.splitlines():
-        if line.startswith("@@"):
-            annotated_lines.append(line)
-            try:
-                parts = line.split()
-                old_info = parts[1].lstrip("-")
-                new_info = parts[2].lstrip("+")
-                current_old = int(old_info.split(",")[0])
-                current_new = int(new_info.split(",")[0])
-            except Exception:
-                current_old = 0
-                current_new = 0
-        elif current_new == 0 and current_old == 0:
-            annotated_lines.append(line)
-        elif line.startswith("+"):
-            if current_new > 0:
-                annotated_lines.append(f"{current_new:5d} + | {line[1:]}")
-                current_new += 1
-            else:
-                annotated_lines.append(line)
-        elif line.startswith("-"):
-            if current_old > 0:
-                annotated_lines.append(f"{current_old:5d} - | {line[1:]}")
-                current_old += 1
-            else:
-                annotated_lines.append(line)
-        elif line.startswith(" ") or line == "":
-            raw_text = line[1:] if line.startswith(" ") else ""
-            if current_new > 0:
-                annotated_lines.append(f"{current_new:5d}   | {raw_text}")
-                current_new += 1
-                current_old += 1
-            else:
-                annotated_lines.append(line)
-        else:
-            annotated_lines.append(line)
-
-    return "\n".join(annotated_lines)
-
-
-def get_valid_diff_lines(patch: str) -> tuple[set[int], set[int]]:
-    """Parse the diff patch to find all valid line numbers for RIGHT side (new file) and LEFT side (old file)."""
-    valid_right = set()
-    valid_left = set()
-    if not patch:
-        return valid_right, valid_left
-
-    current_old = 0
-    current_new = 0
-    for line in patch.splitlines():
-        if line.startswith("@@"):
-            try:
-                parts = line.split()
-                old_info = parts[1].lstrip("-")
-                new_info = parts[2].lstrip("+")
-                current_old = int(old_info.split(",")[0])
-                current_new = int(new_info.split(",")[0])
-            except Exception:
-                current_old = 0
-                current_new = 0
-        elif line.startswith("+"):
-            if current_new > 0:
-                valid_right.add(current_new)
-                current_new += 1
-        elif line.startswith("-"):
-            if current_old > 0:
-                valid_left.add(current_old)
-                current_old += 1
-        elif line.startswith(" ") or line == "":
-            if current_new > 0:
-                valid_right.add(current_new)
-                current_new += 1
-            if current_old > 0:
-                valid_left.add(current_old)
-                current_old += 1
-    return valid_right, valid_left
-
-
-def get_valid_changed_lines(patch: str) -> set[int]:
-    """Parse the diff patch to find all line numbers in the new file (RIGHT side) that are part of the diff."""
-    valid_right, _ = get_valid_diff_lines(patch)
-    return valid_right
-
-
-def _auto_correct_suggestion_range(
-    comment: InlineComment,
-    matched_file: str,
-    valid_set: set[int],
-) -> None:
-    """Auto-correct comment.start_line and comment.line if code_suggestion includes multi-line original file content."""
-    if not comment.code_suggestion:
-        return
-
-    s_lines = [sl.strip() for sl in comment.code_suggestion.strip().splitlines() if sl.strip()]
-    if len(s_lines) <= 1:
-        return
-
-    content = get_file_content(matched_file)
-    if not content:
-        return
-
-    file_lines = {idx: line.strip() for idx, line in enumerate(content.splitlines(), start=1)}
-
-    target_line = comment.line
-
-    if comment.start_line is None:
-        target_str = file_lines.get(target_line, "")
-        if not target_str:
-            return
-
-        match_indices = [idx for idx, sl in enumerate(s_lines) if sl == target_str]
-        if not match_indices:
-            return
-
-        min_line = target_line
-        max_line = target_line
-
-        idx_match = match_indices[0]
-
-        # Check subsequent lines for contiguous sequential match
-        offset = 1
-        while (
-            (target_line + offset) in file_lines
-            and (target_line + offset) in valid_set
-            and (idx_match + offset) < len(s_lines)
-        ):
-            if file_lines[target_line + offset] == s_lines[idx_match + offset]:
-                max_line = target_line + offset
-                offset += 1
-            else:
-                break
-
-        # Check preceding lines for contiguous sequential match
-        offset = 1
-        while (
-            (target_line - offset) in file_lines and (target_line - offset) in valid_set and (idx_match - offset) >= 0
-        ):
-            if file_lines[target_line - offset] == s_lines[idx_match - offset]:
-                min_line = target_line - offset
-                offset += 1
-            else:
-                break
-
-        if min_line < max_line:
-            comment.start_line = min_line
-            comment.line = max_line
-
-
-def _auto_align_suggestion_indentation(comment: InlineComment, matched_file: str) -> None:
-    """Ensure comment.code_suggestion retains the base indentation of the target file line."""
-    if not comment.code_suggestion:
-        return
-
-    content = get_file_content(matched_file)
-    if not content:
-        return
-
-    file_lines = content.splitlines()
-    target_line_idx = (comment.start_line or comment.line) - 1
-    if not (0 <= target_line_idx < len(file_lines)):
-        return
-
-    target_line = file_lines[target_line_idx]
-    target_indent = len(target_line) - len(target_line.lstrip(" \t"))
-    if target_indent == 0:
-        return
-
-    indent_prefix = target_line[:target_indent]
-
-    s_lines = comment.code_suggestion.splitlines()
-    if not s_lines:
-        return
-
-    first_s_indent = len(s_lines[0]) - len(s_lines[0].lstrip(" \t"))
-    if first_s_indent < target_indent:
-        delta = target_indent - first_s_indent
-        indent_addition = indent_prefix[:delta]
-        new_lines = []
-        for line in s_lines:
-            if line.strip():
-                new_lines.append(indent_addition + line)
-            else:
-                new_lines.append(line)
-        comment.code_suggestion = "\n".join(new_lines)
-
-
-def sanitize_code_suggestion(suggestion: str | None) -> str | None:
-    """Sanitise code_suggestion by stripping outer markdown code block fences and line number prefixes."""
-    if not suggestion:
-        return None
-
-    cleaned = suggestion.strip("\r\n")
-    if not cleaned or not cleaned.strip():
-        return None
-
-    # Strip outer markdown code block fences if model enclosed suggestion in ```...```
-    if cleaned.startswith("```") and cleaned.endswith("```"):
-        lines = cleaned.splitlines()
-        if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].strip() == "```":
-            cleaned = "\n".join(lines[1:-1]).strip()
-
-    if not cleaned:
-        return None
-
-    # Strip line number prefixes (e.g. '105 | ', '  105 + | ', '105 - | ', 'L105: ')
-    # Plain numeric prefixes must be pipe-delimited (|) to avoid stripping dict keys (e.g., '105: "foo"').
-    prefix_pattern = re.compile(r"^\s*(?:L\d+[\s\t]*[:|]|\d+[\s\t]*(?:[+-][\s\t]*)?\|)[\s\t]?")
-
-    lines = cleaned.splitlines()
-    if any(prefix_pattern.match(line) for line in lines):
-        cleaned = "\n".join(prefix_pattern.sub("", line, count=1) for line in lines)
-
-    return cleaned if cleaned.strip() else None
-
-
-def filter_review_comments(review: ReviewResult, text_files: list) -> ReviewResult:
-    """Filter inline comments to ensure they apply to valid lines in the diff,
-    redirecting others to general feedback. Sanitises multi-line start_line bounds
-    and code suggestions.
-    """
-    fn_get_valid_diff_lines = _get_pr_review_func("get_valid_diff_lines", get_valid_diff_lines)
-
-    # Map file path -> tuple of valid line number sets (RIGHT, LEFT)
-    file_patches = {f["filename"]: f.get("patch", "") for f in text_files}
-    valid_lines_by_file = {filename: fn_get_valid_diff_lines(patch) for filename, patch in file_patches.items()}
-
-    filtered_comments = []
-    redirected_feedback = []
-
-    for comment in review.comments:
-        if comment.code_suggestion:
-            comment.code_suggestion = sanitize_code_suggestion(comment.code_suggestion)
-
-        comment_path = comment.path.replace("\\", "/")
-
-        matched_file = None
-        for fn in valid_lines_by_file:
-            if fn.replace("\\", "/").lower() == comment_path.lower():
-                matched_file = fn
-                break
-
-        if not matched_file:
-            warning_msg = (
-                f"Warning: Redirecting inline comment on {comment.path}:{comment.line} (File not found in PR changes)."
-            )
-            print(warning_msg, file=sys.stderr)
-
-            feedback_item = f"**{comment.path}** (Line {comment.line}): {comment.severity} {comment.comment_text}"
-            if comment.code_suggestion:
-                feedback_item += f"\n  ```suggestion\n  {comment.code_suggestion}\n  ```"
-            redirected_feedback.append(feedback_item)
-            continue
-
-        valid_right, valid_left = valid_lines_by_file[matched_file]
-        is_left = comment.side and comment.side.upper() == "LEFT"
-        valid_set = valid_left if is_left else valid_right
-
-        # Auto-correct multi-line suggestion range bounds if start_line is omitted
-        _auto_correct_suggestion_range(comment, matched_file, valid_set)
-
-        # Auto-align code suggestion base indentation with target line in source file
-        _auto_align_suggestion_indentation(comment, matched_file)
-
-        # Validate start_line range if present
-        if comment.start_line is not None:
-            if comment.start_line > comment.line:
-                # Swap inverted range bounds
-                comment.start_line, comment.line = comment.line, comment.start_line
-            elif comment.start_line == comment.line:
-                comment.start_line = None
-
-            if comment.start_line is not None and comment.start_line not in valid_set:
-                comment.start_line = None
-
-        if comment.line in valid_set:
-            comment.path = matched_file
-            filtered_comments.append(comment)
-        else:
-            warning_msg = (
-                f"Warning: Redirecting inline comment on {comment.path}:{comment.line} (Line not in PR diff patch)."
-            )
-            print(warning_msg, file=sys.stderr)
-
-            line_str = (
-                f"Lines {comment.start_line}-{comment.line}"
-                if comment.start_line is not None
-                else f"Line {comment.line}"
-            )
-            feedback_item = f"**{comment.path}** ({line_str}): {comment.severity} {comment.comment_text}"
-            if comment.code_suggestion:
-                feedback_item += f"\n  ```suggestion\n  {comment.code_suggestion}\n  ```"
-            redirected_feedback.append(feedback_item)
-
-    if redirected_feedback:
-        review.general_feedback.append("💡 **Additional Feedback on Unmodified Lines:**")
-        review.general_feedback.extend(redirected_feedback)
-
-    review.comments = filtered_comments
-    return review
-
-
-def get_file_content(path: str) -> str:
-    """Read file content safely as UTF-8."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
-    except Exception:
-        return ""
-
-
-def get_local_git_files() -> list:
-    """Developer fallback to gather file diffs from local git tree."""
-    try:
-        res = subprocess.run(["git", "diff", "main...HEAD", "--name-only"], capture_output=True, text=True, check=True)
-        filenames = [f.strip() for f in res.stdout.split("\n") if f.strip()]
-        diff_base = "main...HEAD"
-
-        if not filenames:
-            # Fall back to uncommitted/staged working tree changes vs HEAD
-            res = subprocess.run(["git", "diff", "HEAD", "--name-only"], capture_output=True, text=True, check=True)
-            filenames = [f.strip() for f in res.stdout.split("\n") if f.strip()]
-            diff_base = "HEAD"
-
-        files = []
-        for filename in filenames:
-            diff_res = subprocess.run(
-                ["git", "diff", diff_base, "--", filename], capture_output=True, text=True, check=True
-            )
-            files.append({"filename": filename, "status": "modified", "patch": diff_res.stdout})
-        return files
-
-    except Exception as e:
-        print(f"Error running local git diff: {e}", file=sys.stderr)
-        return []
-
-
-def get_all_repo_files() -> list[str]:
-    """Get list of all tracked text files in the repository."""
-    fn_is_text_file = _get_pr_review_func("is_text_file", is_text_file)
-    try:
-        res = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True)
-        all_files = [f.strip() for f in res.stdout.split("\n") if f.strip()]
-        return [f.replace("\\", "/") for f in all_files if fn_is_text_file(f) and os.path.exists(f)]
-    except Exception as e:
-        print(f"Error running git ls-files: {e}", file=sys.stderr)
-        # Fallback to os.walk if git is not available
-        text_files = []
-        for root, dirs, files in os.walk("."):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for file in files:
-                filepath = os.path.relpath(os.path.join(root, file), ".")
-                if fn_is_text_file(filepath) and os.path.exists(filepath):
-                    text_files.append(filepath.replace("\\", "/"))
-        return text_files
-
-
-def is_core_file(filename: str, patterns: list[str]) -> bool:
-    """Check if the filename matches any of the core file patterns (case-insensitive)."""
-    norm_path = filename.replace("\\", "/").removeprefix("./")
-    basename = os.path.basename(norm_path)
-    posix_path = PurePosixPath(norm_path.lower())
-
-    for pattern in patterns:
-        norm_pat = pattern.replace("\\", "/").removeprefix("./").lower()
-        if "/" in norm_pat:
-            if posix_path.match(norm_pat):
-                return True
-        else:
-            if (
-                fnmatch.fnmatch(basename.lower(), norm_pat)
-                or fnmatch.fnmatch(norm_path.lower(), norm_pat)
-                or posix_path.match(norm_pat)
-            ):
-                return True
-    return False
-
-
-def generate_file_tree(files: list[str]) -> str:
-    """Generate a text-based folder tree structure from a list of file paths."""
-    tree = {}
-    for f in sorted(files):
-        parts = f.replace("\\", "/").split("/")
-        curr = tree
-        for part in parts:
-            if part not in curr:
-                curr[part] = {}
-            curr = curr[part]
-
-    def _render(node: dict, indent: str = "") -> list[str]:
-        lines = []
-        keys = list(node.keys())
-        for idx, key in enumerate(keys):
-            is_last = idx == len(keys) - 1
-            marker = "└── " if is_last else "├── "
-            child_indent = "    " if is_last else "│   "
-            if node[key]:
-                lines.append(f"{indent}{marker}{key}/")
-                lines.extend(_render(node[key], indent + child_indent))
-            else:
-                lines.append(f"{indent}{marker}{key}")
-        return lines
-
-    return ".\n" + "\n".join(_render(tree))
 
 
 def load_workspace_rules() -> str:
@@ -515,8 +140,8 @@ def load_workspace_rules() -> str:
     return "\n".join(rules_content) if rules_content else ""
 
 
-def count_text_tokens(client, model_name: str, text: str) -> int:
-    """Count or estimate the number of tokens in a text string."""
+def count_text_tokens(client, model_name: str, text: str | list | tuple) -> int:
+    """Count or estimate the number of tokens in a text string or multimodal contents list."""
     if not text:
         return 0
     if client and hasattr(client, "models") and hasattr(client.models, "count_tokens"):
@@ -531,7 +156,15 @@ def count_text_tokens(client, model_name: str, text: str) -> int:
                 return total
         except Exception:
             pass
-    # Fallback heuristic (~4 chars per token)
+    # Fallback heuristic (~4 chars per token for text, ~258 tokens per multimodal part)
+    if isinstance(text, (list, tuple)):
+        est = 0
+        for item in text:
+            if isinstance(item, str):
+                est += len(item) // 4
+            else:
+                est += 258
+        return max(1, est)
     return max(1, len(text) // 4)
 
 
@@ -606,3 +239,241 @@ def extract_response_text_or_raise(response: Any) -> str:
     error_msg = "\n".join(diag_lines)
     print(f"Error: {error_msg}", file=sys.stderr)
     raise RuntimeError(error_msg)
+
+
+def _has_usable_text(response: Any) -> bool:
+    """Return True if the response has a non-empty text string."""
+    if not response:
+        return False
+    try:
+        text = getattr(response, "text", None)
+        return isinstance(text, str) and bool(text.strip())
+    except Exception:
+        return False
+
+
+def _extract_function_call_parts(response: Any) -> tuple[Any, list[Any]]:
+    """Extract the model's Content object and any FunctionCall objects from a response."""
+    model_content = None
+    fc_list: list[Any] = []
+
+    try:
+        candidates = getattr(response, "candidates", None)
+        if candidates and len(candidates) > 0:
+            cand_content = getattr(candidates[0], "content", None)
+            if cand_content is not None:
+                model_content = cand_content
+                parts = getattr(cand_content, "parts", None) or []
+                for p in parts:
+                    fc = getattr(p, "function_call", None)
+                    if fc is not None and getattr(fc, "name", None):
+                        fc_list.append(fc)
+    except Exception:
+        pass
+
+    if not fc_list:
+        try:
+            raw_fcs = getattr(response, "function_calls", None)
+            if raw_fcs:
+                for fc in raw_fcs:
+                    if getattr(fc, "name", None) or (isinstance(fc, dict) and fc.get("name")):
+                        fc_list.append(fc)
+        except Exception:
+            pass
+
+    return model_content, fc_list
+
+
+def _accumulate_usage(accumulated: dict[str, int], response: Any) -> None:
+    """Accumulate token usage metrics across multi-turn tool calls."""
+    usage = getattr(response, "usage_metadata", None) if response else None
+    if not usage:
+        return
+    for key in (
+        "prompt_token_count",
+        "cached_content_token_count",
+        "candidates_token_count",
+        "thoughts_token_count",
+        "total_token_count",
+    ):
+        raw = getattr(usage, key, 0)
+        val = int(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else 0
+        accumulated[key] = accumulated.get(key, 0) + val
+
+
+def resolve_tool_calls_loop(
+    client: Any,
+    model_name: str,
+    initial_contents: Any,
+    gen_config: Any,
+    tools: list[Any] | None,
+    response: Any,
+    fallback_contents: Any = None,
+    system_instruction: str | None = None,
+    billing_labels: dict[str, str] | None = None,
+    thinking_cfg: Any = None,
+    max_turns: int = 5,
+) -> Any:
+    """Resolve function_call-only responses and fall back to tool-free generation if needed.
+
+    When Gemini is invoked with `cached_content` (where tool declarations are stored in the
+    cache and `gen_config.tools` is None) or when `response_schema` + `tools` causes the SDK's
+    automatic function calling loop to return a `function_call` part with no text (Issue #42),
+    this loop executes the requested Python tool callables, sends the `function_response` parts
+    back to the model, and repeats up to `max_turns`.
+
+    If the response still lacks usable text after the tool loop (e.g. due to a safety/prohibited
+    content block on a tool turn or exhausted turns), it falls back to a clean tool-free
+    `generate_content` call so the review degrades gracefully instead of crashing the CI run.
+    """
+    from google.genai import types
+
+    if _has_usable_text(response):
+        return response
+
+    function_map: dict[str, Any] = {}
+    for tool_fn in tools or []:
+        if callable(tool_fn):
+            tool_name = getattr(tool_fn, "__name__", None)
+            if isinstance(tool_name, str) and tool_name:
+                # Resolve via _get_pr_review_func so unit test mocks on gemini_review/gemini_pr_review are respected
+                function_map[tool_name] = _get_pr_review_func(tool_name, tool_fn)
+
+    accumulated_usage: dict[str, int] = {}
+    _accumulate_usage(accumulated_usage, response)
+
+    # Normalise initial contents into a single user Content turn (or preserve existing Content list)
+    if isinstance(initial_contents, types.Content):
+        history: list[Any] = [initial_contents]
+    elif isinstance(initial_contents, list) and all(isinstance(c, types.Content) for c in initial_contents):
+        history = list(initial_contents)
+    else:
+        init_parts: list[Any] = []
+        items = initial_contents if isinstance(initial_contents, (list, tuple)) else [initial_contents]
+        for item in items:
+            if isinstance(item, str):
+                init_parts.append(types.Part.from_text(text=item))
+            elif isinstance(item, types.Part):
+                init_parts.append(item)
+            elif isinstance(item, types.Content):
+                init_parts.extend(getattr(item, "parts", None) or [])
+        history = [types.Content(role="user", parts=init_parts)]
+
+    turn = 0
+    while not _has_usable_text(response) and turn < max_turns:
+        model_content, fc_list = _extract_function_call_parts(response)
+        if not fc_list or not function_map:
+            break
+
+        turn += 1
+        response_parts: list[Any] = []
+        model_call_parts: list[Any] = []
+
+        for fc in fc_list:
+            raw_name = getattr(fc, "name", None) if not isinstance(fc, dict) else fc.get("name")
+            if not isinstance(raw_name, str) or not raw_name:
+                continue
+            fn_name: str = raw_name
+            raw_args = getattr(fc, "args", None) if not isinstance(fc, dict) else fc.get("args")
+            call_args = dict(raw_args) if isinstance(raw_args, dict) else {}
+
+            if model_content is None:
+                model_call_parts.append(types.Part.from_function_call(name=fn_name, args=call_args))
+
+            func = function_map.get(fn_name)
+            if func is None:
+                func_result: dict[str, Any] = {"error": f"Unknown tool '{fn_name}'"}
+            else:
+                try:
+                    func_result = {"result": func(**call_args)}
+                except Exception as tool_err:
+                    func_result = {"error": str(tool_err)}
+
+            response_parts.append(types.Part.from_function_response(name=fn_name, response=func_result))
+
+        if not response_parts:
+            break
+
+        if model_content is not None:
+            history.append(model_content)
+        elif model_call_parts:
+            history.append(types.Content(role="model", parts=model_call_parts))
+
+        history.append(types.Content(role="user", parts=response_parts))
+
+        print(
+            f"Resolving {len(fc_list)} tool call(s) (turn {turn}/{max_turns})...",
+            file=sys.stderr,
+        )
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=history,
+                config=gen_config,
+            )
+            _accumulate_usage(accumulated_usage, response)
+        except Exception as turn_err:
+            print(
+                f"Warning: Tool resolution turn {turn} failed ({turn_err}). Proceeding to tool-free fallback...",
+                file=sys.stderr,
+            )
+            break
+
+    # If the response still has no usable text (e.g. blocked on a tool turn, or model returned
+    # function_call when tools were active, or exhausted max_turns), fall back to a tool-free review
+    if not _has_usable_text(response) and (tools or getattr(gen_config, "cached_content", None)):
+        # Log why the tool-enabled response had no text before falling back
+        try:
+            prompt_fb = getattr(response, "prompt_feedback", None)
+            block_reason = getattr(prompt_fb, "block_reason", None) if prompt_fb else None
+            if block_reason:
+                print(
+                    f"Warning: Tool-enabled response blocked (block_reason={block_reason}). "
+                    "Falling back to review without tools...",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "Warning: Model returned non-text response during tool execution. "
+                    "Falling back to review without tools...",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass
+
+        fallback_cfg = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=None,
+            response_mime_type="application/json",
+            response_schema=getattr(gen_config, "response_schema", None),
+            labels=billing_labels,
+            thinking_config=thinking_cfg,
+        )
+        target_contents = fallback_contents if fallback_contents is not None else initial_contents
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=target_contents,
+                config=fallback_cfg,
+            )
+            _accumulate_usage(accumulated_usage, response)
+        except Exception as fb_err:
+            print(f"Warning: Tool-free fallback failed ({fb_err}).", file=sys.stderr)
+
+    # Update usage_metadata on the final response if multiple turns occurred so cost telemetry
+    # accurately reflects all tokens billed across the session.
+    if (
+        turn > 0
+        and response is not None
+        and getattr(response, "usage_metadata", None) is not None
+        and accumulated_usage
+    ):
+        try:
+            usage_obj = response.usage_metadata
+            for key, total_val in accumulated_usage.items():
+                if hasattr(usage_obj, key):
+                    setattr(usage_obj, key, total_val)
+        except Exception:
+            pass
+
+    return response

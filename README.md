@@ -31,6 +31,7 @@ See the supporting blog post about this action [here](https://medium.com/google-
 - [Configuration](#configuration)
   - [Action Inputs](#action-inputs)
   - [Codebase Context Configuration](#codebase-context-configuration)
+  - [Multimodal Context & Visual PR Diffing](#multimodal-context--visual-pr-diffing)
   - [Custom Prompts / Instructions](#custom-prompts--instructions)
   - [Prompt Placeholders](#prompt-placeholders)
 - [Understanding the Token Usage & Cost Efficiency Report](#understanding-the-token-usage--cost-efficiency-report)
@@ -47,12 +48,13 @@ See the supporting blog post about this action [here](https://medium.com/google-
 ![Features Overview](assets/features-overview.png)
 
 - **AI-Powered Code Reviews**: Automated, constructive line-specific feedback on Pull Requests using Google Gemini models (Gemini 3.8 Flash by default).
-- **Automated Issue Triage**: Dynamically labels, prioritises, and triages incoming issues.
+- **Automated Issue Triage**: Dynamically labels, prioritises, and triages incoming issues using text descriptions, discussion comments, and attached remote screenshots.
 - **PR Comment & Discussion Thread History**: Automatically retrieves inline review threads and general PR conversation comments, enabling Gemini to track issue resolution, respect developer justifications/disagreements, and avoid repeating resolved suggestions across commits.
 - **Billing Labels for Cost Attribution (Vertex AI only)**: Tags every request with Cloud Billing labels (`component`, `repo`), so spend per repository is a group-by in the billing export rather than a sum of numbers in review comments.
 - **Tokenomics & Cost Telemetry Report**: Appends a collapsible token usage and **estimated dollar cost** summary to each review, with the rate that was applied stated alongside it.
 - **Drop-in Migration**: Fully compatible as a direct, drop-in replacement for the deprecated `run-gemini-cli` action.
 - **Structured Outputs**: Error-free JSON response formatting using Pydantic schema validation.
+- **Multimodal Context, Visual PR Diffing & Triage Screenshots**: Inspects repository visual assets, issue screenshots, and documents (PNG, JPEG, WebP, GIF, SVG, PDF). Local images referenced in Markdown docs and remote screenshots embedded in issues (`github.com/user-attachments/assets/...`, `githubusercontent.com/...`) are automatically extracted and attached as multimodal parts. When PRs modify images, Gemini performs side-by-side visual diffing between baseline and updated versions to catch visual regressions and layout issues. Includes intelligent deterministic downscaling (Pillow) to minimise token consumption and latency.
 - **Hybrid Codebase Context**: Automatically includes codebase context based on the overall size of the codebase. If the codebase isn't huge, the entire repo is loaded into context; but if it is huge, the agent reads the overall directory tree and judiciously includes a subset of the repo. (Note that it always reads markdown files, dependency files, packaging files, etc.)
 - **Interactive Suggestions**: Formats code recommendations inside native GitHub ` ```suggestion ` blocks for one-click merge applications.
 - **Triggers**: The action triggers automatically in response to PR events. It can also be triggered by posting a comment in the PR starting with `/gemini-review`.
@@ -211,21 +213,30 @@ When reviewing pull requests that have undergone multiple iterations or team dis
 
 ### Setup Using Install-Gemini-Code-Review-Action Skill (Recommended)
 
-If you are using an agentic coding environment like Google Antigravity, you can install and configure this action and its triage workflow automatically using Dazbo's skill from [derailed-dash/dazbo-agent-skills](https://github.com/derailed-dash/dazbo-agent-skills).
+If you are using an agentic coding environment like Google Antigravity, Gemini CLI, or Claude Code, you can install and configure this action and its triage workflow automatically using the `install-gemini-code-review-action` skill.
+
+The skill is maintained in [derailed-dash/dazbo-agent-skills](https://github.com/derailed-dash/dazbo-agent-skills) and is also bundled directly in this repository at [.agents/skills/install-gemini-code-review-action/SKILL.md](.agents/skills/install-gemini-code-review-action/SKILL.md).
 
 > [!IMPORTANT]
 > **Prerequisite:** Regardless of whether you use the automatic skill setup or the manual setup, you must configure authentication (either a Gemini API Key or Workload Identity Federation) as described in the **Authentication** section above.
 
 The `install-gemini-code-review-action` skill automatically handles:
 - Detecting and removing conflicting legacy workflows (e.g., `run-gemini-cli` or `gemini-code-assist`).
-- Asking for your preferences (e.g., installing PR Review, Issue Triage, or both, plus your preferred language and model).
-- Writing the workflow YAML files and default TOML prompt configurations.
-- Commit and push of the new workflow files.
+- Asking for your preferences (e.g., installing PR Review, Issue Triage, or both, plus your preferred reviewer persona, language, and model).
+- Writing the workflow YAML files (with job-level concurrency and fork PR guards) and optional `.github/review-instruction-additions.md` guardrails.
+- Offering to configure the `GEMINI_API_KEY` secret via `gh secret set` and committing/pushing the workflow files.
 
-To install the skill locally, run:
+To install the skill globally from this repository (or from `dazbo-agent-skills`), run:
+
 ```bash
-npx skills add https://github.com/derailed-dash/dazbo-agent-skills -y -g --skill install-gemini-code-review-action
+# Install directly from this repository:
+npx skills add derailed-dash/gemini-review-action -y -g --skill install-gemini-code-review-action
+
+# Or from the canonical dazbo-agent-skills repository:
+npx skills add derailed-dash/dazbo-agent-skills -y -g --skill install-gemini-code-review-action
 ```
+
+*(Note: If you have cloned `gemini-review-action` locally, your IDE agent will automatically discover `.agents/skills/install-gemini-code-review-action/SKILL.md` with zero extra installation.)*
 
 Once installed, simply ask your agent:
 > "Install the Gemini code review action"
@@ -458,15 +469,52 @@ Excluded comments never reach the prompt and are not counted in the reported tok
 | `persona` | Reviewer persona overlay (`straight`, `dazbo`, `palpatine`, `rick`). | No | `straight` |
 | `custom_instructions` | Custom instructions or guardrails to extend the review prompt. Can be inline text or a file path in the repository (e.g. `.github/review-instruction-additions.md`). | No | `.github/review-instruction-additions.md` |
 | `skip_inline_suggestions` | Whether to skip automated re-reviews when a commit is created by accepting an inline suggestion via GitHub UI. | No | `'true'` |
+| `thinking_level` | Thinking level or token budget for reasoning models (`low`, `medium`, `high`, `off`, or integer token budget). When omitted, the model's native default thinking behaviour applies. See [Reasoning & Thinking Budget Control](#reasoning--thinking-budget-control). | No | `''` |
+| `max_candidate_files` | Maximum candidate non-core files to present to Dynamic Context Selection in Sparse Mode (default: 500). | No | `500` |
+| `extra_context_files` | Comma-separated list of repository file paths to attach as additional context, bypassing Dynamic Context Selection. | No | `''` |
+| `context_diff_directories_only` | Whether to restrict candidate context files in Sparse Mode strictly to directories containing modified files from the PR diff. | No | `'false'` |
+| `context_exclude_patterns` | Comma-separated glob patterns to exclude from candidate context files in addition to default exclusions (lockfiles, minified files, test snapshots, and binaries). | No | `''` |
+| `max_multimodal_images` | Maximum number of multimodal images (markdown references, static attachments, visual diffs) attached to review context (default: 20). | No | `20` |
+| `max_triage_images` | Maximum number of remote screenshots attached during issue triage (default: 5). | No | `5` |
+| `image_trigger_bytes` | File size threshold in bytes above which raster images are downscaled before attachment (default: 614400 / 600 KB). | No | `614400` |
+| `image_target_bytes` | Target size in bytes when downscaling large raster images (default: 307200 / 300 KB). | No | `307200` |
 | `timeout` | Timeout for API requests in seconds. | No | `60` |
+
+### Reasoning & Thinking Budget Control
+
+When using reasoning models (such as `gemini-2.5-flash` or `gemini-2.5-pro`), Gemini uses internal reasoning ("thinking") tokens to analyse code diffs, architectural implications, and complex issue triage before outputting a response.
+
+* **Default Behaviour (when omitted)**:
+  If `thinking_level` is left blank (the default), no thinking configuration override is passed to the Gemini API (`thinking_config=None`). The model's native default behaviour applies:
+  * For reasoning models (e.g. Gemini 2.5), thinking is **enabled dynamically** by default.
+  * For non-reasoning models, the request executes normally without thinking tokens.
+* **Disabling Thinking (`off`)**:
+  To disable reasoning tokens completely—reducing latency and token costs (especially recommended for fast issue triage)—set `thinking_level` to `'off'`, `'false'`, `'disabled'`, or `0`. This explicitly sets `thinking_budget=0`.
+* **Constraining Reasoning**:
+  * **Categorical Levels**: `'low'`, `'medium'`, or `'high'` to guide reasoning depth without hard token caps.
+  * **Explicit Token Budgets**: A positive integer (e.g. `1024`, `2048`, `4096`) capping the maximum reasoning tokens.
+
+Thinking token usage and its associated cost are tracked and reported separately in the comment telemetry summary alongside prompt and candidate tokens (priced at the model's standard output rate), allowing you to monitor reasoning overhead and costs accurately.
+
+```yaml
+        with:
+          # Turn off thinking for fast, lightweight issue triage
+          thinking_level: 'off'
+          # Or set a lightweight thinking level or token budget for PR reviews
+          # thinking_level: 'low'
+          # thinking_level: '2048'
+```
 
 ### Codebase Context Configuration
 
 By default, the action uses an intelligent hybrid context engine to feed relevant repository context to the model during review:
 *   **max_context_bytes** (Default: `1500000` / 1.5 MB): The total size of all other text files in the repository. At ~375,000 tokens, 1.5 MB safely fits within Gemini's 1M+ token window while leaving plenty of headroom for the PR diff/patch and structured reviews. If the repository is smaller than this limit, the action runs in *Full Context Mode* and includes all files. If the repository exceeds this limit, it switches to *Sparse Context Mode*.
 *   **max_core_context_bytes** (Default: `500000` / 500 KB): In *Sparse Context Mode*, limits the maximum cumulative size of static core documentation and manifest files attached to the prompt. Any core files beyond this budget are deferred to Dynamic Context Selection.
-*   **Dynamic Context Selection**: In *Sparse Context Mode*, the action uses the configured Gemini model (e.g. `gemini-3.8-flash`) to evaluate modified files/diffs against a 4-tier architectural prioritization framework and select up to 8 of the most relevant candidate repository files (such as imported modules, sister classes, shared utilities, domain/algorithmic precedents, or tests) to attach directly into the review prompt alongside the file tree.
-*   **core_file_patterns**: A list of glob patterns matching project manifests, build definitions, root documentation, templates, and shared utilities (e.g. `README*`, `CONTRIBUTING*`, `ARCHITECTURE*`, `DESIGN*`, `SPEC*`, `DEPLOYMENT*`, `INSTALL*`, `PRODUCT*`, `SDD*`, `TDD*`, `TODO*`, `GEMINI.md`, `*template*`, `*shared*`, `*util*`, `*common*`, `*core*`, `pyproject.toml`, `package.json`) that are prioritized in *Sparse Context Mode*.
+*   **Dynamic Context Selection**: In *Sparse Context Mode*, the action evaluates modified files/diffs against candidate non-core repository files to attach up to 8 of the most relevant sister modules, utilities, domain/algorithmic precedents, or tests.
+    *   **Candidate Bounding**: To safeguard large monorepos against context selection token bloat or quota exhaustion, candidates are bounded to `max_candidate_files` (default 500) using proximity and import ranking heuristics. You can also restrict candidates strictly to directories touched by the PR diff with `context_diff_directories_only: 'true'`.
+    *   **Built-in & Custom Exclusions**: Binary assets, package manager lockfiles (`pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`, `uv.lock`, `go.sum`, etc.), minified bundles (`.min.js`, `.min.css`), source maps (`.map`), and test snapshots are automatically excluded from context candidates. You can supply additional glob patterns using `context_exclude_patterns`.
+    *   **Static Context Override**: If you know exactly which additional files Gemini needs, specify `extra_context_files` to attach them directly and bypass Dynamic Context Selection entirely.
+*   **core_file_patterns**: A list of glob patterns matching project manifests, build definitions, root documentation, templates, and shared utilities (e.g. `README*`, `CONTRIBUTING*`, `ARCHITECTURE*`, `DESIGN*`, `SPEC*`, `DEPLOYMENT*`, `INSTALL*`, `PRODUCT*`, `SDD*`, `TDD*`, `TODO*`, `GEMINI.md`, `*template*`, `*shared*`, `*util*`, `*common*`, `*core*`, `pyproject.toml`, `package.json`) that are prioritised in *Sparse Context Mode*.
 
 You can configure these settings by adding the following keys to your custom `.github/commands/gemini-review.toml` configuration (or via `GEMINI_MAX_CONTEXT_BYTES` and `GEMINI_MAX_CORE_CONTEXT_BYTES`):
 
@@ -481,7 +529,27 @@ core_file_patterns = [
 ]
 ```
 
+### Multimodal Context & Visual PR Diffing
 
+Gemini Review Action supports multimodal context inspection, side-by-side visual PR diffing, and remote screenshot extraction for issue triage:
+
+* **Automatic Markdown Image Reference Resolution**:
+  Whenever Markdown documentation (such as `README.md`, `DESIGN.md`, `ARCHITECTURE.md`, or newly added diff documentation) is included in the review context, any local repository images referenced via standard Markdown (`![alt](path/to/img.png)`) or HTML (`<img src="path/to/img.png">`) are automatically extracted, validated against path traversal, and attached as multimodal parts. This gives Gemini the complete visual context behind architecture diagrams, wireframes, and screenshots referenced in documentation.
+* **Side-by-Side Visual PR Diffing**:
+  When a Pull Request adds, deletes, or modifies visual assets (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.svg`), the action constructs structured visual diff parts for Gemini:
+  - For modified images, both the baseline version (`base_sha`) and the updated version (`head_sha`) are retrieved directly and presented side-by-side with clear labels.
+  - Gemini evaluates visual diffs for visual regressions, UI alignment, resolution degradation, icon consistency, and styling changes.
+* **Remote Screenshot Extraction for Issue Triage**:
+  During issue triage (`command: 'triage'`), the action parses the issue body and discussion comments for remote HTTPS image URLs (`![alt](https://...)` and `<img src="https://...">`), including extensionless GitHub user-uploaded assets (`github.com/user-attachments/assets/...` and `githubusercontent.com/...`):
+  - For GitHub-hosted URLs, requests automatically include `Authorization: Bearer <GITHUB_TOKEN>` so screenshots in private or internal repositories are fetched seamlessly (credentials are never sent to third-party domains).
+  - Screenshots are streamed with a 20 MB download safety limit, downscaled via `optimize_image_bytes()`, and attached as `types.Part.from_bytes` up to `max_triage_images` (default: `5`). If any remote screenshot fails or times out, triage gracefully continues with text-only classification.
+* **Deterministic Pillow Downscaling**:
+  To protect token budgets and reduce inference latency, large raster graphics are automatically downscaled before being attached:
+  - Any raster image exceeding `image_trigger_bytes` (default: `614400` / 600 KB) is deterministically downscaled using high-quality Lanczos resampling and re-compressed towards `image_target_bytes` (default: `307200` / 300 KB).
+  - Scalable Vector Graphics (`image/svg+xml`) and PDF documents (`application/pdf`) bypass lossy compression to preserve full vector fidelity and textual clarity.
+* **Static Context Overrides & Safety Ceilings**:
+  - You can explicitly attach visual diagrams or design specifications using `extra_context_files` (e.g. `extra_context_files: 'docs/architecture.png,specs/api-spec.pdf'`).
+  - The `max_multimodal_images` input (default: `20`) and `max_triage_images` input (default: `5`) provide safety ceilings capping the total number of multimodal attachments.
 
 ### Reviewer Personas
 
@@ -597,12 +665,14 @@ Whenever a review run finishes, the action provides token telemetry in two place
    | **Input Tokens (uncached)** | 14,414 |
    | **Input Tokens (cached)** | 250,985 (⚡ 94.4% cached) |
    | **PR Comments History Tokens** | 450 |
+   | **Thinking / Reasoning Tokens** | 2,048 |
    | **Output Tokens** | 210 |
-   | **Total Session Tokens** | **267,701** |
-   | **Cost (uncached input)** | $0.0111 |
+   | **Total Session Tokens** | **268,107** |
+   | **Cost (uncached input)** | $0.0108 |
    | **Cost (cached input)** | $0.0188 |
-   | **Cost (output)** | $0.0008 |
-   | **Estimated Total Cost** | **$0.0307** |
+   | **Cost (thinking / reasoning)** | $0.0077 |
+   | **Cost (response output)** | $0.0008 |
+   | **Estimated Total Cost** | **$0.0381** |
 
    > Gemini 3.8 Flash: introductory rate $0.75/$3.75 per 1M applied; reverts to $1.5/$7.5 after 2026-12-31.
    > Context-cache STORAGE is billed per token-hour and is not reported here, so the figure runs slightly low on repositories reviewed infrequently.
@@ -612,7 +682,7 @@ Whenever a review run finishes, the action provides token telemetry in two place
 2. **Workflow Execution Logs**: A concise single-line token summary log printed to the runner `stderr`:
 
 ```text
-Token Usage: 14,414 input tokens (94.4% cached), 210 output tokens. Total: 267,701 tokens. Estimated cost: $0.0307.
+Token Usage: 14,414 input tokens (94.4% cached), 2,048 thinking tokens, 210 output tokens. Total: 268,107 tokens. Estimated cost: $0.0381.
 ```
 
 ### Metrics Explained
@@ -621,8 +691,10 @@ Token Usage: 14,414 input tokens (94.4% cached), 210 output tokens. Total: 267,7
 * **Cached Context Tokens (`├── Cached Context Tokens`)**: The portion of input tokens stored in Gemini's server-side context cache. Context caching applies **exclusively to input tokens**, providing an **automatic 90% rate discount** on cached input tokens.
 * **PR Comments History Tokens (`├── PR Comments History Tokens`)**: The exact token count consumed by historical inline review threads and conversation comments fetched via the GitHub API and included in the dynamic review context.
 * **Un-cached Fresh Tokens (`└── Un-cached Fresh Tokens`)**: The newly introduced PR diff lines and dynamic skill instructions, billed at standard input rates.
-* **Output (Candidates) Tokens**: The number of tokens generated by Gemini in its structured review response JSON. Context caching does not apply to output tokens, which are billed at standard model output rates.
-* **Total Session Tokens**: The combined total of prompt and output tokens processed during the review.
+* **Thinking / Reasoning Tokens**: The internal reasoning tokens consumed by thinking models (such as Gemini 2.5) while evaluating complex logic and diffs.
+* **Output Tokens**: The final structured review tokens (markdown comments and suggestions) returned by the model.
+* **Cost (thinking / reasoning) & Cost (response output)**: Under the Google Gemini API pricing model, reasoning/thinking tokens are billed at the **standard output rate** (`rate.output`). Whenever thinking tokens are generated, the cost report transparently splits out the cost of reasoning from the cost of final response candidates, giving you full visibility into the cost impact of your chosen `thinking_level`.
+* **Total Session Tokens**: The combined total of prompt, thinking, and candidate output tokens processed during the review.
 * **Estimated Total Cost**: The token counts above priced at the model's published rate. **A model with no entry in the rate table reports tokens and no cost** rather than borrowing another model's rate, because a missing number is obvious and a wrong one is not. Where a model has a time-boxed introductory rate, the end date is part of the table, so the figure stays correct on both sides of it and a note says which rate was applied.
 * **Cost caveats**: Rendered as quoted lines under the table rather than left to documentation — the introductory-rate note, and the fact that context-cache **storage** (billed per token-hour) is not counted, so the estimate runs slightly low.
 
@@ -727,13 +799,22 @@ Here is an overview of the directory tree and the purpose of each file:
 ├── docs/                    # Technical documentation and architecture guides
 ├── gemini_review/           # Modular review engine package
 │   ├── __init__.py          # Package exports & public API facade bindings
+│   ├── billing_labels.py    # Google Cloud billing labels parsing & attribution
+│   ├── budget.py            # Token budget allocation & per-file content truncation
 │   ├── config.py            # Configuration loader and default settings
+│   ├── context.py           # Hybrid codebase context engine & dynamic context selection
 │   ├── developer_knowledge.py # Google Developer Knowledge API integration
+│   ├── diff.py              # Diff patch parsing, line numbering & suggestion alignment
 │   ├── github.py            # GitHub REST API interactions & review submission
+│   ├── multimodal.py        # Image/PDF MIME detection, Pillow downscaling & image extraction
+│   ├── personas.py          # Reviewer persona registry & prompt generation
+│   ├── pricing.py           # Token pricing calculation & review cost estimation
+│   ├── prompts.py           # Prompt builders, system instructions & visual diff assembly
+│   ├── repo.py              # File discovery, file tree generation & candidate bounding
 │   ├── schemas.py           # Pydantic schemas (InlineComment, ReviewResult)
-│   ├── prompts.py           # Prompt builders and system instruction loader
 │   ├── skills.py            # Workspace skill discovery & instruction loader
-│   └── utils.py             # File filtering, diff parsing, token counter & git utils
+│   ├── threads.py           # Discussion thread retrieval & automated resolution
+│   └── utils.py             # Core primitives (token estimation, rules loader) & facade re-exports
 ├── scripts/                 # Developer and maintenance utility scripts
 ├── starter-examples/        # Starter workflow files, default prompt templates, and skills manifest
 ├── tests/                   # Unit tests
